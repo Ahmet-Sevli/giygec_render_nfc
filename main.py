@@ -64,7 +64,7 @@ def virtual_try_on(
 
         # --- GÜNCELLENEN KISIM: VIP (Token) Girişi ---
         hf_token = os.environ.get('HF_TOKEN')
-        client = Client("yisol/IDM-VTON", hf_token=hf_token)
+        client = Client("yisol/IDM-VTON", token=hf_token)
         # ---------------------------------------------
 
         result = client.predict(
