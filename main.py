@@ -31,7 +31,7 @@ async def check_payment(uid: str):
         return {"status": "error", "message": "UID eksik"}
     
     if not db:
-        return {"status": "error", "message": "Veritabanı bağlantısı yok"}
+        return {"status": "error", "message": "Veritabanı bağlantısı yok."}
 
     try:
         doc_ref = db.collection('products').document(uid)
