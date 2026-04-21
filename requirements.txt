@@ -1,4 +1,6 @@
 fastapi
 uvicorn
-firebase-admin
 gunicorn
+python-multipart
+firebase-admin
+gradio_client
