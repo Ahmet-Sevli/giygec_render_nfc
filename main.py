@@ -262,6 +262,7 @@ class CartItemModel(BaseModel):
 class KombinRequest(BaseModel):
     user_text: str
     cart_items: List[CartItemModel] = []
+    gender: str = ""  # "erkek" veya "kadın"
 
 @app.post("/kombin-oner")
 async def kombin_oner(request: KombinRequest):
@@ -279,7 +280,7 @@ async def kombin_oner(request: KombinRequest):
             cart_context = "\n".join(cart_lines)
 
         # 2. Grok API'ye Analiz Yaptır
-        grok_analysis = ask_grok_kombin(request.user_text, cart_context)
+        grok_analysis = ask_grok_kombin(request.user_text, cart_context, request.gender)
 
         categories = grok_analysis.get("determined_categories", [])
 
@@ -302,6 +303,9 @@ async def kombin_oner(request: KombinRequest):
         # 6. Kategori başına en iyi 1 ürün seç (kombin oluştur)
         kombin = pick_best_per_category(best_matches, categories)
 
+        # 7. Popülerlik geri bildirimi
+        popularity = calculate_popularity(kombin)
+
         return {
             "status": "success",
             "ai_explanation": grok_analysis.get("explanation", ""),
@@ -309,7 +313,8 @@ async def kombin_oner(request: KombinRequest):
                 "max_price": grok_analysis.get("max_price"),
                 "excluded_tags": grok_analysis.get("exclude_tags", [])
             },
-            "recommendations": kombin
+            "recommendations": kombin,
+            "popularity": popularity
         }
 
     except Exception as e:
@@ -323,6 +328,7 @@ class VisionRequest(BaseModel):
     mime_type: str = "image/jpeg"
     user_text: str = ""
     cart_items: List[CartItemModel] = []
+    gender: str = ""
 
 @app.post("/vision-analiz")
 async def vision_analiz(request: VisionRequest):
@@ -340,7 +346,7 @@ async def vision_analiz(request: VisionRequest):
             cart_context = "\n".join(cart_lines)
 
         # 2. Grok Vision API'ye gönder
-        grok_analysis = ask_grok_vision(request.image_base64, request.mime_type, request.user_text, cart_context)
+        grok_analysis = ask_grok_vision(request.image_base64, request.mime_type, request.user_text, cart_context, request.gender)
 
         categories = grok_analysis.get("determined_categories", [])
 
@@ -363,6 +369,9 @@ async def vision_analiz(request: VisionRequest):
         # 6. Kombin oluştur
         kombin = pick_best_per_category(best_matches, categories)
 
+        # 7. Popülerlik
+        popularity = calculate_popularity(kombin)
+
         return {
             "status": "success",
             "ai_explanation": grok_analysis.get("explanation", ""),
@@ -370,7 +379,8 @@ async def vision_analiz(request: VisionRequest):
                 "max_price": grok_analysis.get("max_price"),
                 "excluded_tags": grok_analysis.get("exclude_tags", [])
             },
-            "recommendations": kombin
+            "recommendations": kombin,
+            "popularity": popularity
         }
 
     except Exception as e:
@@ -385,6 +395,15 @@ FASHION_RULES_PROMPT = """
 Sen "GiyGeç" uygulamasının UZMAN AI moda danışmanısın.
 
 ═══════════════════════════════════════
+CİNSİYET KURALI (KRİTİK):
+═══════════════════════════════════════
+Kullanıcının cinsiyeti belirtilmişse SADECE o cinsiyete uygun ürünler öner.
+- Erkek → erkek pantolonu, erkek tişörtü, erkek ayakkabısı. ASLA kadın ürünü önerme.
+- Kadın → kadın pantolonu, kadın elbisesi, kadın ayakkabısı. ASLA erkek ürünü önerme.
+style_analysis'e cinsiyet etiketini de ekle (örn: "erkek": 0.9 veya "kadın": 0.9).
+Ayrıca HER ZAMAN "unisex" etiketini de style_analysis içine ekle (örn: "unisex": 0.7), böylece unisex ürünler de uygun şekilde eşleşebilsin.
+
+═══════════════════════════════════════
 EVRENSEL MODA KURALLARI (Her zaman uygula):
 ═══════════════════════════════════════
 
@@ -392,54 +411,52 @@ EVRENSEL MODA KURALLARI (Her zaman uygula):
    - %60 Ana renk (pantolon/etek gibi geniş alan kaplayan parça)
    - %30 İkincil renk (tişört/gömlek gibi üst parça)
    - %10 Vurgu rengi (ayakkabı/aksesuar)
-   Renk önerirken bu dengeyi koru.
 
 2. ORANT KURALI (1/3 - 2/3):
    - Yüksek bel pantolon + kısa/crop üst = DOĞRU
-   - Uzun üst + düşük bel = YANLIŞ (boyu kısa gösterir)
-   - Yüksek bel geniş pantolon gördüğünde fitted/crop üst öner
+   - Uzun üst + düşük bel = YANLIŞ
 
 3. HACİM DENGESİ:
-   - Üst oversize → Alt dar (slim/skinny) olmalı
-   - Alt geniş (wide-leg/palazzo) → Üst fitted/oturan olmalı
-   - İki geniş veya iki dar parça ASLA ÖNERME
+   - Üst oversize → Alt dar olmalı
+   - Alt geniş → Üst fitted olmalı
 
 4. DESEN KURALI:
    - Bir kombinde MAX 1 desenli parça
-   - Üst desenli ise alt MUTLAKA düz renk
-   - Çizgili + leopar = ASLA
 
 5. DRESS CODE:
-   - Smart Casual: Temiz sneaker OK, koşu ayakkabısı HAYIR. Jean = koyu + yırtıksız
-   - Business Formal: Siyah/lacivert/füme. Minimal desen
+   - Smart Casual: Temiz sneaker OK, koşu ayakkabısı HAYIR
+   - Business Formal: Siyah/lacivert/füme
    - Bohem: Toprak tonları, floral, doğal kumaş
    - Sportif: Jogger, sneaker, sweatshirt
 
-6. ELBİSE KURALI: Elbise seçersen pantolon/tişört EKLEME (elbise üst+alt'ı kapsar). Sadece ayakkabı/aksesuar ekle.
+6. ELBİSE KURALI: Elbise seçersen pantolon/tişört EKLEME.
 
 ═══════════════════════════════════════
 JSON ÇIKTI KURALLARI:
 ═══════════════════════════════════════
 
 1. 'determined_categories': [pantolon, tisort, elbise, ayakkabi] listesinden seç.
-   - Sepette olan kategorileri TEKRAR SEÇME (kullanıcı özellikle istemedikçe).
 
-2. 'style_analysis': Kullanıcının istediği etiketleri VE EŞ ANLAMLILARINI üret.
-   Örnek: "nişan" → {"nişan": 0.9, "düğün": 0.7, "abiye": 0.8, "özel gün": 0.6, "şık": 0.7, "elegant": 0.5}
-   Örnek: "yazlık" → {"yazlık": 0.9, "yaz": 0.8, "hafif": 0.6, "ince": 0.5, "serin": 0.4}
-   Her zaman en az 6-8 etiket üret.
+2. 'style_analysis': Kullanıcının istediği HER KELİME için kapsamlı eş anlamlıları üret.
+   HER kelime için en az 5-8 eş anlamlı/ilişkili etiket üret. Örnekler:
+   "nişan" → {"nişan": 0.9, "düğün": 0.7, "abiye": 0.8, "özel gün": 0.6, "şık": 0.7, "elegant": 0.5, "davet": 0.6, "gece": 0.4}
+   "yazlık" → {"yazlık": 0.9, "yaz": 0.8, "hafif": 0.6, "ince": 0.5, "serin": 0.4, "plaj": 0.3, "tatil": 0.4}
+   "spor" → {"spor": 0.9, "sportif": 0.8, "rahat": 0.7, "casual": 0.6, "günlük": 0.5, "aktif": 0.5, "fitness": 0.4}
+   "klasik" → {"klasik": 0.9, "formal": 0.8, "iş": 0.7, "ofis": 0.6, "business": 0.5, "resmi": 0.7, "düz": 0.4}
+   "romantik" → {"romantik": 0.9, "sevgililer günü": 0.7, "floral": 0.6, "pastel": 0.5, "zarif": 0.7, "feminen": 0.6}
+   "sokak" → {"sokak": 0.9, "street": 0.8, "urban": 0.7, "hip-hop": 0.5, "günlük": 0.6, "cool": 0.5}
 
 3. 'exclude_tags': İstenmeyen + moda kuralına göre uyumsuz etiketler. Boşsa [].
 
 4. 'max_price': Bütçe varsa sayı, yoksa null.
 
-5. 'explanation': Kararını ve moda kuralı gerekçeni anlatan 2-3 cümle. Türkçe. Kullanıcıya hitap et.
+5. 'explanation': Kararını ve moda kuralı gerekçeni anlatan 2-3 cümle. Türkçe.
 
 6. SADECE GEÇERLİ JSON DÖN. Markdown/backtick KULLANMA.
 """
 
 
-def ask_grok_kombin(user_text: str, cart_context: str = ""):
+def ask_grok_kombin(user_text: str, cart_context: str = "", gender: str = ""):
     """Metin tabanlı kombin analizi için Grok'a istek atar."""
     grok_api_key = os.environ.get('GROK_API_KEY')
     if not grok_api_key:
@@ -451,14 +468,18 @@ def ask_grok_kombin(user_text: str, cart_context: str = ""):
         "Content-Type": "application/json"
     }
 
-    user_message = user_text
+    gender_prefix = ""
+    if gender:
+        gender_prefix = f"[CİNSİYET: {gender.upper()}] — SADECE {gender} kıyafetleri öner!\n\n"
+
+    user_message = gender_prefix + user_text
     if cart_context:
-        user_message = f"""Kullanıcının isteği: {user_text}
+        user_message = f"""{gender_prefix}Kullanıcının isteği: {user_text}
 
 Kullanıcının sepetindeki mevcut ürünler:
 {cart_context}
 
-Sepetteki ürünleri dikkate alarak eksik parçaları tamamla. Sepette olan kategorileri tekrar önerme. Hacim ve renk dengesini sepetteki ürünlere göre ayarla."""
+Sepetteki ürünleri dikkate alarak eksik parçaları tamamla."""
 
     data = {
         "model": "grok-4-1-fast-non-reasoning",
@@ -478,7 +499,7 @@ Sepetteki ürünleri dikkate alarak eksik parçaları tamamla. Sepette olan kate
     return json.loads(result_text)
 
 
-def ask_grok_vision(image_base64: str, mime_type: str, user_text: str = "", cart_context: str = ""):
+def ask_grok_vision(image_base64: str, mime_type: str, user_text: str = "", cart_context: str = "", gender: str = ""):
     """Görsel tabanlı kombin analizi için Grok Vision'a istek atar."""
     grok_api_key = os.environ.get('GROK_API_KEY')
     if not grok_api_key:
@@ -490,7 +511,11 @@ def ask_grok_vision(image_base64: str, mime_type: str, user_text: str = "", cart
         "Content-Type": "application/json"
     }
 
-    text_content = "Fotoğraftaki kıyafeti analiz et ve uyumlu tamamlayıcı parçalar öner."
+    gender_prefix = ""
+    if gender:
+        gender_prefix = f"[CİNSİYET: {gender.upper()}] — SADECE {gender} kıyafetleri öner!\n"
+
+    text_content = gender_prefix + "Fotoğraftaki kıyafeti analiz et ve uyumlu tamamlayıcı parçalar öner."
     if user_text:
         text_content += f"\n\nKullanıcının ek isteği: {user_text}"
     if cart_context:
@@ -556,7 +581,7 @@ def fetch_products(categories: list):
 
 
 def calculate_scores(products: list, grok_analysis: dict, cart_ids: set = None):
-    """Ürünleri Grok ağırlıklarına göre puanlar."""
+    """Ürünleri Grok ağırlıklarına göre puanlar + description ek puanı."""
     weights = grok_analysis.get("style_analysis", {})
     excludes = grok_analysis.get("exclude_tags", [])
     max_price = grok_analysis.get("max_price")
@@ -568,6 +593,7 @@ def calculate_scores(products: list, grok_analysis: dict, cart_ids: set = None):
         product_id = product.get("id", "")
         product_price = product.get("price", 0)
         product_tags = [tag.lower() for tag in product.get("styleTags", [])]
+        product_desc = product.get("description", "").lower()
 
         # Sepette olan ürünü önerme
         if cart_ids and product_id in cart_ids:
@@ -581,25 +607,42 @@ def calculate_scores(products: list, grok_analysis: dict, cart_ids: set = None):
         if any(bad_tag in product_tags for bad_tag in excludes_lower):
             continue
 
-        # Puanlama
-        score = 0.0
+        # --- StyleTags Puanlama ---
+        tag_score = 0.0
         matched_tags = []
         for ai_tag, weight in weights.items():
             ai_tag_lower = ai_tag.lower()
-            # Tam eşleşme
             if ai_tag_lower in product_tags:
-                score += float(weight)
+                tag_score += float(weight)
                 matched_tags.append(ai_tag)
             else:
-                # Kısmi eşleşme (contains)
                 for pt in product_tags:
                     if ai_tag_lower in pt or pt in ai_tag_lower:
-                        score += float(weight) * 0.6
+                        tag_score += float(weight) * 0.6
                         matched_tags.append(f"{ai_tag}~{pt}")
                         break
 
-        if score > 0:
-            product["ai_match_score"] = round(score, 2)
+        # --- Description Ek Puanlama (1-10) ---
+        desc_score = 0.0
+        desc_matches = 0
+        if product_desc:
+            for ai_tag, weight in weights.items():
+                ai_tag_lower = ai_tag.lower()
+                if ai_tag_lower in product_desc:
+                    desc_matches += 1
+
+        if len(weights) > 0 and desc_matches > 0:
+            desc_ratio = desc_matches / len(weights)
+            desc_score = round(desc_ratio * 10, 1)  # 1-10 arası
+            desc_score = min(desc_score, 10.0)
+
+        # Toplam skor = tag puanı + description ek puanı (ağırlıklı)
+        total_score = tag_score + (desc_score * 0.3)
+
+        if total_score > 0:
+            product["ai_match_score"] = round(total_score, 2)
+            product["tag_score"] = round(tag_score, 2)
+            product["desc_score"] = round(desc_score, 1)
             product["matched_tags"] = matched_tags
             scored_products.append(product)
 
@@ -616,7 +659,6 @@ def pick_best_per_category(scored_products: list, categories: list):
         cat = product.get("_source_category", product.get("category", ""))
         if cat not in used_categories:
             used_categories.add(cat)
-            # Dahili alanları temizle
             clean_product = {k: v for k, v in product.items() if not k.startswith("_")}
             kombin.append(clean_product)
 
@@ -624,3 +666,81 @@ def pick_best_per_category(scored_products: list, categories: list):
             break
 
     return kombin
+
+
+# ==========================================
+# POPÜLERLIK HESAPLAMA
+# ==========================================
+UPPER_CATEGORIES = {"tisort", "elbise", "gömlek", "kazak", "sweatshirt", "bluz"}
+LOWER_CATEGORIES = {"pantolon", "ayakkabi", "etek", "şort"}
+
+def calculate_popularity(kombin: list):
+    """Tüm kaydedilmiş kombinlere bakarak benzerlik yüzdesi hesaplar."""
+    if not db or not kombin:
+        return {"percentage": 0, "message": ""}
+
+    try:
+        # Tüm kullanıcıların kayıtlı kombinlerini çek
+        saved_docs = db.collection("saved_outfits").stream()
+        all_saved = []
+        for doc in saved_docs:
+            data = doc.to_dict()
+            products = data.get("products", [])
+            if products:
+                all_saved.append(products)
+
+        if not all_saved:
+            return {"percentage": 0, "message": ""}
+
+        # Yeni kombindeki ürün ID'leri ve kategorileri
+        new_ids = set()
+        new_names = set()
+        for p in kombin:
+            if p.get("id"):
+                new_ids.add(p["id"])
+            if p.get("name"):
+                new_names.add(p["name"].lower())
+
+        similar_count = 0
+        total_similarity_score = 0.0
+
+        for saved_products in all_saved:
+            outfit_similarity = 0.0
+            has_match = False
+
+            for sp in saved_products:
+                sp_id = sp.get("id", sp.get("uid", ""))
+                sp_name = sp.get("name", "").lower()
+                sp_cat = sp.get("category", "").lower()
+
+                matched = sp_id in new_ids or sp_name in new_names
+                if not matched:
+                    continue
+
+                has_match = True
+                # Üst giyim → yüksek katsayı, alt giyim → düşük katsayı
+                if sp_cat in UPPER_CATEGORIES:
+                    outfit_similarity += 0.4
+                elif sp_cat in LOWER_CATEGORIES:
+                    outfit_similarity += 0.2
+                else:
+                    outfit_similarity += 0.3
+
+            if has_match:
+                similar_count += 1
+                total_similarity_score += min(outfit_similarity, 1.0)
+
+        if similar_count == 0:
+            return {"percentage": 0, "message": ""}
+
+        avg_similarity = total_similarity_score / similar_count
+        percentage = round((similar_count / len(all_saved)) * 100 * avg_similarity)
+        percentage = min(percentage, 100)
+
+        message = f"Kullanıcıların %{percentage}'i benzer ürünler içeren kombinleri beğendi!"
+        return {"percentage": percentage, "message": message}
+
+    except Exception as e:
+        print(f"Popülerlik hesaplama hatası: {e}")
+        return {"percentage": 0, "message": ""}
+
