@@ -182,6 +182,74 @@ async def virtual_try_on_chain(request: ChainedTryOnRequest):
                     pass
 
 # ==========================================
+# 4b. VIRTUAL TRY-ON — TEK ADIM (Adım Adım Canlı Giydirme)
+# ==========================================
+class SingleStepTryOnRequest(BaseModel):
+    person_image_base64: str
+    garment_image_url: str
+    garment_description: str = "A stylish garment"
+
+@app.post("/virtual-try-on-step")
+async def virtual_try_on_step(request: SingleStepTryOnRequest):
+    """
+    Tek bir kıyafeti giydirir ve sonucu döner.
+    Flutter bu endpoint'i her kıyafet için sırayla çağırır.
+    Bir önceki sonucu person_image olarak gönderir → zincirleme etki.
+    """
+    temp_dir = tempfile.gettempdir()
+    session_id = str(uuid.uuid4())
+    hf_token = os.environ.get('HF_TOKEN')
+    temp_files = []
+
+    try:
+        # Kullanıcı/önceki sonuç fotoğrafını decode et
+        person_bytes = base64.b64decode(request.person_image_base64)
+        person_path = os.path.join(temp_dir, f"step_person_{session_id}.jpg")
+        with open(person_path, "wb") as f:
+            f.write(person_bytes)
+        temp_files.append(person_path)
+
+        # Kıyafet resmini URL'den indir
+        garment_path = os.path.join(temp_dir, f"step_garment_{session_id}.jpg")
+        img_response = requests.get(request.garment_image_url, timeout=30)
+        img_response.raise_for_status()
+        with open(garment_path, "wb") as f:
+            f.write(img_response.content)
+        temp_files.append(garment_path)
+
+        # HuggingFace'e gönder
+        client = Client("yisol/IDM-VTON", token=hf_token)
+        result = client.predict(
+            dict={"background": gradio_file(person_path), "layers": [], "composite": None},
+            garm_img=gradio_file(garment_path),
+            garment_des=request.garment_description,
+            is_checked=True,
+            is_checked_crop=False,
+            denoise_steps=20,
+            seed=42,
+            api_name="/tryon"
+        )
+
+        with open(result[0], "rb") as img_file:
+            result_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+
+        return {
+            "status": "success",
+            "message": "Kıyafet başarıyla giydirildi!",
+            "result_image_base64": result_base64
+        }
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+    finally:
+        for tf in temp_files:
+            if os.path.exists(tf):
+                try:
+                    os.remove(tf)
+                except:
+                    pass
+
+# ==========================================
 # 5. AI KOMBİN ÖNERİ SİSTEMİ
 # ==========================================
 class CartItemModel(BaseModel):
