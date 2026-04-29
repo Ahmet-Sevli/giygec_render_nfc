@@ -28,7 +28,7 @@ if firebase_key_raw:
 # ==========================================
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "GİYGEÇ Sistemi Ayakta ve AI Kombin Motoru Devrede!"}
+    return {"status": "ok", "message": "GİYGEÇ Sistemi Ayakta ve AI Kombin Motoru Devrede!!"}
 
 @app.get("/check-payment")
 async def check_payment(uid: str):
