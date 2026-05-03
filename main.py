@@ -297,24 +297,34 @@ async def kombin_oner(request: KombinRequest):
                 if item.id:
                     cart_ids.add(item.id)
 
-        # 5. Akıllı Puanlama
-        best_matches = calculate_scores(db_products, grok_analysis, cart_ids)
+        # 5. Akıllı Puanlama (cinsiyet filtresiyle)
+        best_matches = calculate_scores(db_products, grok_analysis, cart_ids, request.gender)
 
-        # 6. Kategori başına en iyi 1 ürün seç (kombin oluştur)
-        kombin = pick_best_per_category(best_matches, categories)
+        # 6. Benzersiz alternatif kombinleri üret (maksimum 3 adet)
+        all_combinations = pick_multiple_kombins(best_matches, categories, max_kombins=3)
+        if not all_combinations:
+            return {"status": "success", "message": "Yeterli ürün bulunamadı.", "results": []}
 
-        # 7. Popülerlik geri bildirimi
-        popularity = calculate_popularity(kombin)
+        # 7. Her kombin için ayrı bir TTS özeti üret (tek API çağrısıyla)
+        summaries = generate_multiple_summaries(all_combinations, grok_analysis.get("explanation", ""))
+
+        # 8. Sonuçları hazırla (her kombine kendi açıklaması ve popülerlik puanı atanır)
+        results = []
+        for i, komb in enumerate(all_combinations):
+            pop = calculate_popularity(komb)
+            results.append({
+                "products": komb,
+                "ai_explanation": summaries[i] if i < len(summaries) else grok_analysis.get("explanation", ""),
+                "popularity": pop
+            })
 
         return {
             "status": "success",
-            "ai_explanation": grok_analysis.get("explanation", ""),
             "applied_filters": {
                 "max_price": grok_analysis.get("max_price"),
                 "excluded_tags": grok_analysis.get("exclude_tags", [])
             },
-            "recommendations": kombin,
-            "popularity": popularity
+            "results": results
         }
 
     except Exception as e:
@@ -363,24 +373,34 @@ async def vision_analiz(request: VisionRequest):
                 if item.id:
                     cart_ids.add(item.id)
 
-        # 5. Puanla
-        best_matches = calculate_scores(db_products, grok_analysis, cart_ids)
+        # 5. Akıllı Puanlama (cinsiyet filtresiyle)
+        best_matches = calculate_scores(db_products, grok_analysis, cart_ids, request.gender)
 
-        # 6. Kombin oluştur
-        kombin = pick_best_per_category(best_matches, categories)
+        # 6. Kombinleri üret
+        all_combinations = pick_multiple_kombins(best_matches, categories, max_kombins=3)
+        if not all_combinations:
+            return {"status": "success", "message": "Yeterli ürün bulunamadı.", "results": []}
 
-        # 7. Popülerlik
-        popularity = calculate_popularity(kombin)
+        # 7. Her kombin için ayrı bir TTS özeti üret
+        summaries = generate_multiple_summaries(all_combinations, grok_analysis.get("explanation", ""))
+
+        # 8. Sonuçları hazırla
+        results = []
+        for i, komb in enumerate(all_combinations):
+            pop = calculate_popularity(komb)
+            results.append({
+                "products": komb,
+                "ai_explanation": summaries[i] if i < len(summaries) else grok_analysis.get("explanation", ""),
+                "popularity": pop
+            })
 
         return {
             "status": "success",
-            "ai_explanation": grok_analysis.get("explanation", ""),
             "applied_filters": {
                 "max_price": grok_analysis.get("max_price"),
                 "excluded_tags": grok_analysis.get("exclude_tags", [])
             },
-            "recommendations": kombin,
-            "popularity": popularity
+            "results": results
         }
 
     except Exception as e:
@@ -435,7 +455,7 @@ EVRENSEL MODA KURALLARI (Her zaman uygula):
 JSON ÇIKTI KURALLARI:
 ═══════════════════════════════════════
 
-1. 'determined_categories': [pantolon, tisort, elbise, ayakkabi] listesinden seç.
+1. 'determined_categories': [pantolon, tisort, elbise, ayakkabi] listesinden seç. Sadece bu 4 kategoriden bahset, gömlek/kazak gibi diğerlerini kullanma!
 
 2. 'style_analysis': Kullanıcının istediği HER KELİME için kapsamlı eş anlamlıları üret.
    HER kelime için en az 5-8 eş anlamlı/ilişkili etiket üret. Örnekler:
@@ -450,7 +470,7 @@ JSON ÇIKTI KURALLARI:
 
 4. 'max_price': Bütçe varsa sayı, yoksa null.
 
-5. 'explanation': Kararını ve moda kuralı gerekçeni anlatan 2-3 cümle. Türkçe.
+5. 'explanation': Kararını ve gerekçeni anlatan çok KISA ve ÖZ 1-2 cümle. Çok uzatma, sesli asistan okuyacağı için özet geç! Türkçe.
 
 6. SADECE GEÇERLİ JSON DÖN. Markdown/backtick KULLANMA.
 """
@@ -548,6 +568,67 @@ def ask_grok_vision(image_base64: str, mime_type: str, user_text: str = "", cart
     return json.loads(result_text)
 
 
+def generate_multiple_summaries(kombins: list, grok_explanation: str) -> list:
+    """Birden fazla kombin için tek bir Grok isteği ile ayrı ayrı özetler üretir."""
+    if not kombins:
+        return []
+
+    grok_api_key = os.environ.get('GROK_API_KEY')
+    if not grok_api_key:
+        return [grok_explanation] * len(kombins)
+
+    url = "https://api.x.ai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {grok_api_key}",
+        "Content-Type": "application/json"
+    }
+
+    prompt_lines = [f"Genel Tarz: {grok_explanation}", ""]
+    for i, komb in enumerate(kombins):
+        prompt_lines.append(f"Kombin {i+1}:")
+        for p in komb:
+            name = p.get('name', '')
+            desc = p.get('description', '')
+            prompt_lines.append(f"- {name}: {desc}")
+        prompt_lines.append("")
+
+    user_message = "\n".join(prompt_lines)
+
+    system_prompt = """Sen akıcı konuşan bir yapay zeka stil danışmanısın. 
+Sana seçtiğimiz BİRDEN FAZLA kombinin (Kombin 1, Kombin 2 vb.) detayları verilecek.
+Görevin: Her bir kombin için, o kombinin özelliklerini (kumaş, kesim vb.) katarak ayrı ayrı ÇOK KISA (1-2 cümlelik) ve AKICI özetler yazmak. 
+Çıktıyı KESİNLİKLE aşağıdaki formatta geçerli bir JSON array olarak dön:
+[
+  "Senin için birinci kombin olarak şunları seçtim...",
+  "İkinci bir alternatif olarak şu ürünleri bir araya getirdim...",
+  "Son olarak bu parçalarla harika bir tarz yakalayabilirsin..."
+]
+Markdown (```json vs) veya liste kullanma, SADECE saf bir JSON array döndür."""
+
+    data = {
+        "model": "grok-4-1-fast-non-reasoning",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ],
+        "temperature": 0.2
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=15)
+        response.raise_for_status()
+        text = response.json()['choices'][0]['message']['content'].strip()
+        text = clean_json_response(text)
+        summaries = json.loads(text)
+        if isinstance(summaries, list) and len(summaries) >= len(kombins):
+            return summaries[:len(kombins)]
+        else:
+            return [grok_explanation] * len(kombins)
+    except Exception as e:
+        print(f"Multiple summary error: {e}")
+        return [grok_explanation] * len(kombins)
+
+
 def clean_json_response(text: str) -> str:
     """Grok'un döndürdüğü metinden JSON'u güvenli şekilde çıkarır."""
     # 1. ```json ... ``` bloğu varsa içini al
@@ -580,14 +661,25 @@ def fetch_products(categories: list):
     return products
 
 
-def calculate_scores(products: list, grok_analysis: dict, cart_ids: set = None):
-    """Ürünleri Grok ağırlıklarına göre puanlar + description ek puanı."""
+def calculate_scores(products: list, grok_analysis: dict, cart_ids: set = None, gender: str = ""):
+    """Ürünleri Grok ağırlıklarına göre puanlar + description ek puanı + cinsiyet filtresi."""
     weights = grok_analysis.get("style_analysis", {})
     excludes = grok_analysis.get("exclude_tags", [])
     max_price = grok_analysis.get("max_price")
 
     scored_products = []
     excludes_lower = [ex.lower() for ex in excludes] if excludes else []
+    
+    # Cinsiyet filtresi hazırla
+    gender_lower = gender.lower() if gender else ""
+    # Erkek istendiğinde: erkek veya unisex etiketli
+    # Kadın istendiğinde: kadın veya unisex etiketli
+    # Boşsa: filtre yok
+    allowed_gender_tags = set()
+    if gender_lower in ("erkek", "erkek"):
+        allowed_gender_tags = {"erkek", "unisex"}
+    elif gender_lower in ("kadın", "kadin"):
+        allowed_gender_tags = {"kadın", "unisex"}
 
     for product in products:
         product_id = product.get("id", "")
@@ -606,6 +698,13 @@ def calculate_scores(products: list, grok_analysis: dict, cart_ids: set = None):
         # İstenmeyen etiket filtresi
         if any(bad_tag in product_tags for bad_tag in excludes_lower):
             continue
+
+        # Cinsiyet filtresi: eğer allowed_gender_tags doluysa ürün bu etiketlerden birini taşımalı
+        if allowed_gender_tags:
+            product_gender_tags = set(product_tags) & {"erkek", "kadın", "unisex"}
+            # Ürün hiç cinsiyet etiketi taşımıyorsa veya izin verilen etiket yoksa atla
+            if not product_gender_tags or not (product_gender_tags & allowed_gender_tags):
+                continue
 
         # --- StyleTags Puanlama ---
         tag_score = 0.0
@@ -668,11 +767,52 @@ def pick_best_per_category(scored_products: list, categories: list):
     return kombin
 
 
+def pick_multiple_kombins(scored_products: list, categories: list, max_kombins: int = 3):
+    """
+    Her kategori için ayrı ayrı en iyi ürünleri alır ve bunları aynı sıradakilerle eşleştirerek
+    (1.ler birbiriyle, 2.ler birbiriyle) birbirinden bağımsız kombinler oluşturur.
+    Çaprazlama (itertools.product) YAPMAZ, böylece 3 farklı kombinde aynı tişört tekrar etmez,
+    tamamen farklı görünümler sunulur.
+    """
+    # Kategori başına top N ürün listesi oluştur
+    by_cat = {cat: [] for cat in categories}
+    for product in scored_products:  # zaten puana göre sıralı
+        cat = product.get("_source_category", product.get("category", ""))
+        if cat in by_cat and len(by_cat[cat]) < max_kombins:
+            clean = {k: v for k, v in product.items() if not k.startswith("_")}
+            by_cat[cat].append(clean)
+
+    kombins = []
+    for i in range(max_kombins):
+        kombin = []
+        for cat in categories:
+            cat_products = by_cat.get(cat, [])
+            if cat_products:
+                # İlgili sıradaki ürün varsa onu al, yoksa eldeki en sonuncuyu tekrar et (fallback)
+                idx = min(i, len(cat_products) - 1)
+                kombin.append(cat_products[idx])
+        if kombin:
+            kombins.append(kombin)
+
+    # Tamamen aynı kombinleri filtrele
+    seen_keys = set()
+    unique_kombins = []
+    for komb in kombins:
+        key = "|".join(sorted(p.get("id", p.get("name", "")) for p in komb))
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_kombins.append(komb)
+            if len(unique_kombins) >= max_kombins:
+                break
+
+    return unique_kombins
+
+
 # ==========================================
 # POPÜLERLIK HESAPLAMA
 # ==========================================
-UPPER_CATEGORIES = {"tisort", "elbise", "gömlek", "kazak", "sweatshirt", "bluz"}
-LOWER_CATEGORIES = {"pantolon", "ayakkabi", "etek", "şort"}
+UPPER_CATEGORIES = {"tisort", "elbise"}
+LOWER_CATEGORIES = {"pantolon", "ayakkabi"}
 
 def calculate_popularity(kombin: list):
     """Tüm kaydedilmiş kombinlere bakarak benzerlik yüzdesi hesaplar."""
@@ -737,7 +877,14 @@ def calculate_popularity(kombin: list):
         percentage = round((similar_count / len(all_saved)) * 100 * avg_similarity)
         percentage = min(percentage, 100)
 
-        message = f"Kullanıcıların %{percentage}'i benzer ürünler içeren kombinleri beğendi!"
+        # Yüzdeye göre zenginleştirilmiş mesaj
+        if percentage <= 15:
+            message = f"🌟 Nadir bir kombin keşfettiniz! Bu kombinasyon diğer kullanıcıların yalnızca %{percentage}'inde görülüyor. Tarzınız gerçekten özgün!"
+        elif percentage <= 50:
+            message = f"✨ Kullanıcıların %{percentage}'i bu kombinleri beğendi. Modadan anlıyorsunuz!"
+        else:
+            message = f"🔥 Bu kombinasyon çok popüler! Kullanıcıların %{percentage}'i bu tarz kombinleri seviyor. Herkes bu trendi takip ediyor!"
+
         return {"percentage": percentage, "message": message}
 
     except Exception as e:
