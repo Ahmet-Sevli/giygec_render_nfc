@@ -9,7 +9,7 @@ import replicate
 app = FastAPI()
 
 # ==========================================
-# 1. FIREBASE KURULUMU
+# 1. FIREBASE KURULUMU.
 # ==========================================
 firebase_key_raw = os.environ.get('FIREBASE_KEY')
 db = None
