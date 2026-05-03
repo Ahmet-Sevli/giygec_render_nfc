@@ -6,3 +6,4 @@ firebase-admin
 gradio_client
 pydantic
 requests
+replicate
