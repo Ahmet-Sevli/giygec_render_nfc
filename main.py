@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 import os, json, firebase_admin, uuid, shutil, base64, tempfile, requests, re
 from firebase_admin import credentials, firestore
-from gradio_client import Client, file as gradio_file
+import replicate
 
 app = FastAPI()
 
@@ -22,6 +22,9 @@ if firebase_key_raw:
         print("✅ Firebase bağlantısı başarılı!")
     except Exception as e:
         print(f"❌ Firebase başlatılamadı: {e}")
+
+# Replicate API Key (Render Environment Variables üzerinden çekilir)
+os.environ["REPLICATE_API_TOKEN"] = os.environ.get("KOLORS_API", "")
 
 # ==========================================
 # 2. TEMEL ENDPOINT'LER
@@ -51,54 +54,107 @@ async def check_payment(uid: str):
 # ==========================================
 @app.post("/virtual-try-on")
 def virtual_try_on(person_image: UploadFile = File(...), garment_image: UploadFile = File(...)):
-    temp_dir = tempfile.gettempdir()
-    temp_id = str(uuid.uuid4())
-    person_path = os.path.join(temp_dir, f"person_{temp_id}.jpg")
-    garment_path = os.path.join(temp_dir, f"garment_{temp_id}.jpg")
-
+    """Replicate ile tekil giydirme (Legacy API uyumluluğu için)"""
     try:
-        with open(person_path, "wb") as buffer:
-            shutil.copyfileobj(person_image.file, buffer)
-        with open(garment_path, "wb") as buffer:
-            shutil.copyfileobj(garment_image.file, buffer)
+        # Resimleri geçici olarak kaydet
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as p_file:
+            shutil.copyfileobj(person_image.file, p_file)
+            p_path = p_file.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as g_file:
+            shutil.copyfileobj(garment_image.file, g_file)
+            g_path = g_file.name
 
-        hf_token = os.environ.get('HF_TOKEN')
-        client = Client("yisol/IDM-VTON", token=hf_token)
-
-        result = client.predict(
-            dict={"background": gradio_file(person_path), "layers": [], "composite": None},
-            garm_img=gradio_file(garment_path),
-            garment_des="A stylish garment",
-            is_checked=True,
-            is_checked_crop=False,
-            denoise_steps=30,
-            seed=42,
-            api_name="/tryon"
+        output = replicate.run(
+            "cuuupid/kolors-virtual-try-on:57a0786522c0766299b8006e89758778f7734f0c4cf5796013a7c6f059f13e7c",
+            input={
+                "person_img": open(p_path, "rb"),
+                "garment_img": open(g_path, "rb"),
+                "category": "Upper-body"
+            }
         )
+        
+        # Replicate genellikle URL döner, resmi indirip base64'e çevirelim
+        res_url = output if isinstance(output, str) else output[0]
+        img_res = requests.get(res_url)
+        encoded_string = base64.b64encode(img_res.content).decode('utf-8')
 
-        with open(result[0], "rb") as image_file:
-            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-
-        return {"status": "success", "message": "Kıyafet başarıyla giydirildi!", "image_base64": encoded_string}
+        os.remove(p_path)
+        os.remove(g_path)
+        return {"status": "success", "image_base64": encoded_string}
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-    finally:
-        if os.path.exists(person_path): os.remove(person_path)
-        if os.path.exists(garment_path): os.remove(garment_path)
 
 # ==========================================
 # 4. VIRTUAL TRY-ON — ZİNCİRLEME KOMBİN
 # ==========================================
 class ChainedTryOnRequest(BaseModel):
     person_image_base64: str
-    garments: list  # [{"image_url": "...", "description": "Siyah slim fit pantolon, dar kesim, uzun paça", "category": "pantolon"}, ...]
+    garments: list  # [{"image_url": "...", "description": "Siyah slim fit pantolon, dar kesim, uzun paça"}, ...]
 
 @app.post("/virtual-try-on-chain")
 async def virtual_try_on_chain(request: ChainedTryOnRequest):
-    """
-    Zincirleme sanal deneme: Birden fazla kıyafeti sırayla giydirir.
-    Alt giyim ve elbiseler OOTDiffusion'a, üst giyimler IDM-VTON'a yönlendirilir.
-    """
+    """Replicate (Kolors) ile zincirleme giydirme."""
+    temp_dir = tempfile.gettempdir()
+    session_id = str(uuid.uuid4())
+    temp_files = []
+
+    try:
+        # Başlangıç resmi (Kullanıcı)
+        person_bytes = base64.b64decode(request.person_image_base64)
+        current_person_path = os.path.join(temp_dir, f"chain_person_{session_id}.jpg")
+        with open(current_person_path, "wb") as f:
+            f.write(person_bytes)
+        temp_files.append(current_person_path)
+
+        progress_results = []
+
+        for i, garment in enumerate(request.garments):
+            g_url = garment.get("image_url", "")
+            g_cat_tr = garment.get("category", "").lower()
+            
+            if not g_url: continue
+
+            # Kategori Mapping (Kritik!)
+            # Replicate/Kolors: 'Upper-body', 'Lower-body', 'Dress' bekler.
+            replicate_cat = "Upper-body"
+            if any(x in g_cat_tr for x in ["pantolon", "etek", "şort", "sort", "alt"]):
+                replicate_cat = "Lower-body"
+            elif any(x in g_cat_tr for x in ["elbise", "fistan", "tulum"]):
+                replicate_cat = "Dress"
+
+            # Replicate Çağrısı
+            output = replicate.run(
+                "cuuupid/kolors-virtual-try-on:57a0786522c0766299b8006e89758778f7734f0c4cf5796013a7c6f059f13e7c",
+                input={
+                    "person_img": open(current_person_path, "rb"),
+                    "garment_img": g_url, # Replicate doğrudan URL kabul eder
+                    "category": replicate_cat
+                }
+            )
+            
+            res_url = output if isinstance(output, str) else output[0]
+            img_res = requests.get(res_url)
+            
+            # Bir sonraki adım için resmi güncelle
+            next_person_path = os.path.join(temp_dir, f"chain_res_{session_id}_{i}.jpg")
+            with open(next_person_path, "wb") as f:
+                f.write(img_res.content)
+            temp_files.append(next_person_path)
+            current_person_path = next_person_path
+
+            # Base64 dönüştür (UI için)
+            step_base64 = base64.b64encode(img_res.content).decode('utf-8')
+            progress_results.append({
+                "step": i + 1,
+                "garment_name": garment.get("name", f"Parça {i+1}"),
+                "image_base64": step_base64
+            })
+
+        return {
+            "status": "success",
+            "final_image_base64": progress_results[-1]["image_base64"],
+            "steps": progress_results
+        }
     temp_dir = tempfile.gettempdir()
     session_id = str(uuid.uuid4())
     hf_token = os.environ.get('HF_TOKEN')
@@ -119,7 +175,6 @@ async def virtual_try_on_chain(request: ChainedTryOnRequest):
         for i, garment in enumerate(request.garments):
             garment_url = garment.get("image_url", "")
             garment_desc = garment.get("description", "A stylish garment")
-            garment_cat = garment.get("category", "").lower()
 
             if not garment_url:
                 continue
@@ -133,65 +188,26 @@ async def virtual_try_on_chain(request: ChainedTryOnRequest):
             with open(garment_path, "wb") as f:
                 f.write(img_response.content)
 
-            is_lower_body = any(w in garment_cat for w in ['pantolon', 'etek', 'şort', 'sort', 'lower'])
-            is_dress = 'elbise' in garment_cat or 'dress' in garment_cat
-
-            if is_lower_body or is_dress:
-                # Alt giyim veya elbise için OOTDiffusion
-                cat_arg = "Dress" if is_dress else "Lower-body"
-                client = Client("levihsu/OOTDiffusion", token=hf_token)
-                res = client.predict(
-                    vton_img=gradio_file(current_person_path),
-                    garm_img=gradio_file(garment_path),
-                    category=cat_arg,
-                    n_samples=1,
-                    n_steps=20,
-                    image_scale=2.0,
-                    seed=42,
-                    api_name="/process_dc"
-                )
-                
-                # Gallery formatını çözümle
-                out_path = res
-                if isinstance(res, list) and len(res) > 0:
-                    first = res[0]
-                    if isinstance(first, dict):
-                        out_path = first.get("image", first.get("name", ""))
-                    elif isinstance(first, tuple):
-                        out_path = first[0]
-                    else:
-                        out_path = first
-                elif isinstance(res, tuple) and isinstance(res[0], list) and len(res[0]) > 0:
-                    first = res[0][0]
-                    if isinstance(first, dict):
-                        out_path = first.get("image", first.get("name", ""))
-                    elif isinstance(first, tuple):
-                        out_path = first[0]
-                    else:
-                        out_path = first
-            else:
-                # Üst giyim için IDM-VTON
-                client = Client("yisol/IDM-VTON", token=hf_token)
-                res = client.predict(
-                    dict={"background": gradio_file(current_person_path), "layers": [], "composite": None},
-                    garm_img=gradio_file(garment_path),
-                    garment_des=garment_desc,
-                    is_checked=True,
-                    is_checked_crop=False,
-                    denoise_steps=30,
-                    seed=42,
-                    api_name="/tryon"
-                )
-                out_path = res[0]
+            # HuggingFace'e gönder
+            result = client.predict(
+                dict={"background": gradio_file(current_person_path), "layers": [], "composite": None},
+                garm_img=gradio_file(garment_path),
+                garment_des=garment_desc,
+                is_checked=True,
+                is_checked_crop=False,
+                denoise_steps=30,
+                seed=42,
+                api_name="/tryon"
+            )
 
             # Sonucu bir sonraki adımın "person" resmi olarak kaydet
             next_person_path = os.path.join(temp_dir, f"chain_result_{session_id}_{i}.jpg")
             temp_files.append(next_person_path)
-            shutil.copy2(out_path, next_person_path)
+            shutil.copy2(result[0], next_person_path)
             current_person_path = next_person_path
 
             # Bu adımın sonuç resmini base64 olarak kaydet
-            with open(out_path, "rb") as img_file:
+            with open(result[0], "rb") as img_file:
                 step_base64 = base64.b64encode(img_file.read()).decode('utf-8')
                 progress_results.append({
                     "step": i + 1,
@@ -226,89 +242,48 @@ class SingleStepTryOnRequest(BaseModel):
     person_image_base64: str
     garment_image_url: str
     garment_description: str = "A stylish garment"
-    category: str = "üst giyim"
 
 @app.post("/virtual-try-on-step")
 async def virtual_try_on_step(request: SingleStepTryOnRequest):
-    """
-    Tek bir kıyafeti giydirir ve sonucu döner.
-    Alt giyim ve elbiseler OOTDiffusion'a, üst giyimler IDM-VTON'a yönlendirilir.
-    """
+    """Tekli adımı Replicate (Kolors) ile yap."""
     temp_dir = tempfile.gettempdir()
     session_id = str(uuid.uuid4())
-    hf_token = os.environ.get('HF_TOKEN')
-    temp_files = []
-
+    
     try:
-        # Kullanıcı/önceki sonuç fotoğrafını decode et
         person_bytes = base64.b64decode(request.person_image_base64)
         person_path = os.path.join(temp_dir, f"step_person_{session_id}.jpg")
         with open(person_path, "wb") as f:
             f.write(person_bytes)
-        temp_files.append(person_path)
 
-        # Kıyafet resmini URL'den indir
-        garment_path = os.path.join(temp_dir, f"step_garment_{session_id}.jpg")
-        img_response = requests.get(request.garment_image_url, timeout=30)
-        img_response.raise_for_status()
-        with open(garment_path, "wb") as f:
-            f.write(img_response.content)
-        temp_files.append(garment_path)
+        # Kategori tespiti
+        g_cat_tr = request.category.lower()
+        replicate_cat = "Upper-body"
+        if any(x in g_cat_tr for x in ["pantolon", "etek", "şort", "sort", "alt"]):
+            replicate_cat = "Lower-body"
+        elif any(x in g_cat_tr for x in ["elbise", "fistan", "tulum"]):
+            replicate_cat = "Dress"
 
-        garment_cat = request.category.lower()
-        is_lower_body = any(w in garment_cat for w in ['pantolon', 'etek', 'şort', 'sort', 'lower'])
-        is_dress = 'elbise' in garment_cat or 'dress' in garment_cat
+        output = replicate.run(
+            "cuuupid/kolors-virtual-try-on:57a0786522c0766299b8006e89758778f7734f0c4cf5796013a7c6f059f13e7c",
+            input={
+                "person_img": open(person_path, "rb"),
+                "garment_img": request.garment_image_url,
+                "category": replicate_cat
+            }
+        )
+        
+        res_url = output if isinstance(output, str) else output[0]
+        img_res = requests.get(res_url)
+        result_base64 = base64.b64encode(img_res.content).decode('utf-8')
 
-        if is_lower_body or is_dress:
-            # Alt giyim veya elbise için OOTDiffusion
-            cat_arg = "Dress" if is_dress else "Lower-body"
-            client = Client("levihsu/OOTDiffusion", token=hf_token)
-            res = client.predict(
-                vton_img=gradio_file(person_path),
-                garm_img=gradio_file(garment_path),
-                category=cat_arg,
-                n_samples=1,
-                n_steps=20,
-                image_scale=2.0,
-                seed=42,
-                api_name="/process_dc"
-            )
-            
-            # Gallery formatını çözümle
-            out_path = res
-            if isinstance(res, list) and len(res) > 0:
-                first = res[0]
-                if isinstance(first, dict):
-                    out_path = first.get("image", first.get("name", ""))
-                elif isinstance(first, tuple):
-                    out_path = first[0]
-                else:
-                    out_path = first
-            elif isinstance(res, tuple) and isinstance(res[0], list) and len(res[0]) > 0:
-                first = res[0][0]
-                if isinstance(first, dict):
-                    out_path = first.get("image", first.get("name", ""))
-                elif isinstance(first, tuple):
-                    out_path = first[0]
-                else:
-                    out_path = first
-        else:
-            # Üst giyim için IDM-VTON
-            client = Client("yisol/IDM-VTON", token=hf_token)
-            res = client.predict(
-                dict={"background": gradio_file(person_path), "layers": [], "composite": None},
-                garm_img=gradio_file(garment_path),
-                garment_des=request.garment_description,
-                is_checked=True,
-                is_checked_crop=False,
-                denoise_steps=20,
-                seed=42,
-                api_name="/tryon"
-            )
-            out_path = res[0]
-
-        with open(out_path, "rb") as img_file:
-            result_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+        if os.path.exists(person_path): os.remove(person_path)
+        
+        return {
+            "status": "success",
+            "result_image_base64": result_base64
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
         return {
             "status": "success",
