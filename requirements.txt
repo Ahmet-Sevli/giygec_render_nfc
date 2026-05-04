@@ -7,4 +7,3 @@ gradio_client
 pydantic
 replicate
 requests
-
