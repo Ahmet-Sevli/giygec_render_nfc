@@ -9,7 +9,7 @@ import replicate
 app = FastAPI()
 
 # ==========================================
-# 1. FIREBASE KURULUMU.
+# 1. FIREBASE KURULUMU
 # ==========================================
 firebase_key_raw = os.environ.get('FIREBASE_KEY')
 db = None
@@ -155,76 +155,6 @@ async def virtual_try_on_chain(request: ChainedTryOnRequest):
             "final_image_base64": progress_results[-1]["image_base64"],
             "steps": progress_results
         }
-    temp_dir = tempfile.gettempdir()
-    session_id = str(uuid.uuid4())
-    hf_token = os.environ.get('HF_TOKEN')
-    temp_files = []
-
-    try:
-        # Kullanıcı fotoğrafını decode et
-        person_bytes = base64.b64decode(request.person_image_base64)
-        current_person_path = os.path.join(temp_dir, f"chain_person_{session_id}.jpg")
-        with open(current_person_path, "wb") as f:
-            f.write(person_bytes)
-        temp_files.append(current_person_path)
-
-        client = Client("yisol/IDM-VTON", token=hf_token)
-
-        progress_results = []  # Her adımın sonucunu tut
-
-        for i, garment in enumerate(request.garments):
-            garment_url = garment.get("image_url", "")
-            garment_desc = garment.get("description", "A stylish garment")
-
-            if not garment_url:
-                continue
-
-            # Kıyafet resmini URL'den indir
-            garment_path = os.path.join(temp_dir, f"chain_garment_{session_id}_{i}.jpg")
-            temp_files.append(garment_path)
-
-            img_response = requests.get(garment_url, timeout=30)
-            img_response.raise_for_status()
-            with open(garment_path, "wb") as f:
-                f.write(img_response.content)
-
-            # HuggingFace'e gönder
-            result = client.predict(
-                dict={"background": gradio_file(current_person_path), "layers": [], "composite": None},
-                garm_img=gradio_file(garment_path),
-                garment_des=garment_desc,
-                is_checked=True,
-                is_checked_crop=False,
-                denoise_steps=30,
-                seed=42,
-                api_name="/tryon"
-            )
-
-            # Sonucu bir sonraki adımın "person" resmi olarak kaydet
-            next_person_path = os.path.join(temp_dir, f"chain_result_{session_id}_{i}.jpg")
-            temp_files.append(next_person_path)
-            shutil.copy2(result[0], next_person_path)
-            current_person_path = next_person_path
-
-            # Bu adımın sonuç resmini base64 olarak kaydet
-            with open(result[0], "rb") as img_file:
-                step_base64 = base64.b64encode(img_file.read()).decode('utf-8')
-                progress_results.append({
-                    "step": i + 1,
-                    "garment_name": garment.get("name", f"Parça {i+1}"),
-                    "image_base64": step_base64
-                })
-
-        if not progress_results:
-            return JSONResponse(status_code=400, content={"status": "error", "message": "Hiçbir kıyafet giydirilemedi."})
-
-        return {
-            "status": "success",
-            "message": f"{len(progress_results)} parça başarıyla giydirildi!",
-            "final_image_base64": progress_results[-1]["image_base64"],
-            "steps": progress_results
-        }
-
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
     finally:
@@ -235,6 +165,7 @@ async def virtual_try_on_chain(request: ChainedTryOnRequest):
                 except:
                     pass
 
+
 # ==========================================
 # 4b. VIRTUAL TRY-ON — TEK ADIM (Adım Adım Canlı Giydirme)
 # ==========================================
@@ -242,6 +173,7 @@ class SingleStepTryOnRequest(BaseModel):
     person_image_base64: str
     garment_image_url: str
     garment_description: str = "A stylish garment"
+    category: str = "üst giyim"
 
 @app.post("/virtual-try-on-step")
 async def virtual_try_on_step(request: SingleStepTryOnRequest):
