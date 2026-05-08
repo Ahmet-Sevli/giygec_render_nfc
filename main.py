@@ -4,7 +4,8 @@ from pydantic import BaseModel
 from typing import Optional, List
 import os, json, firebase_admin, uuid, shutil, base64, tempfile, requests, re
 from firebase_admin import credentials, firestore
-import replicate
+from gradio_client import Client, file as gradio_file
+from datetime import datetime
 
 app = FastAPI()
 
@@ -22,9 +23,6 @@ if firebase_key_raw:
         print("✅ Firebase bağlantısı başarılı!")
     except Exception as e:
         print(f"❌ Firebase başlatılamadı: {e}")
-
-# Replicate API Key (Render Environment Variables üzerinden çekilir)
-os.environ["REPLICATE_API_TOKEN"] = os.environ.get("KOLORS_API", "")
 
 # ==========================================
 # 2. TEMEL ENDPOINT'LER
@@ -54,35 +52,40 @@ async def check_payment(uid: str):
 # ==========================================
 @app.post("/virtual-try-on")
 def virtual_try_on(person_image: UploadFile = File(...), garment_image: UploadFile = File(...)):
-    """Replicate ile tekil giydirme (Legacy API uyumluluğu için)"""
+    temp_dir = tempfile.gettempdir()
+    temp_id = str(uuid.uuid4())
+    person_path = os.path.join(temp_dir, f"person_{temp_id}.jpg")
+    garment_path = os.path.join(temp_dir, f"garment_{temp_id}.jpg")
+
     try:
-        # Resimleri geçici olarak kaydet
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as p_file:
-            shutil.copyfileobj(person_image.file, p_file)
-            p_path = p_file.name
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as g_file:
-            shutil.copyfileobj(garment_image.file, g_file)
-            g_path = g_file.name
+        with open(person_path, "wb") as buffer:
+            shutil.copyfileobj(person_image.file, buffer)
+        with open(garment_path, "wb") as buffer:
+            shutil.copyfileobj(garment_image.file, buffer)
 
-        output = replicate.run(
-            "cuuupid/kolors-virtual-try-on:57a0786522c0766299b8006e89758778f7734f0c4cf5796013a7c6f059f13e7c",
-            input={
-                "person_img": open(p_path, "rb"),
-                "garment_img": open(g_path, "rb"),
-                "category": "Upper-body"
-            }
+        hf_token = os.environ.get('HF_TOKEN')
+        client = Client("yisol/IDM-VTON", token=hf_token)
+
+        result = client.predict(
+            dict={"background": gradio_file(person_path), "layers": [], "composite": None},
+            garm_img=gradio_file(garment_path),
+            garment_des="A stylish garment",
+            is_checked=True,
+            is_checked_crop=False,
+            denoise_steps=30,
+            seed=42,
+            api_name="/tryon"
         )
-        
-        # Replicate genellikle URL döner, resmi indirip base64'e çevirelim
-        res_url = output if isinstance(output, str) else output[0]
-        img_res = requests.get(res_url)
-        encoded_string = base64.b64encode(img_res.content).decode('utf-8')
 
-        os.remove(p_path)
-        os.remove(g_path)
-        return {"status": "success", "image_base64": encoded_string}
+        with open(result[0], "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+
+        return {"status": "success", "message": "Kıyafet başarıyla giydirildi!", "image_base64": encoded_string}
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+    finally:
+        if os.path.exists(person_path): os.remove(person_path)
+        if os.path.exists(garment_path): os.remove(garment_path)
 
 # ==========================================
 # 4. VIRTUAL TRY-ON — ZİNCİRLEME KOMBİN
@@ -93,68 +96,82 @@ class ChainedTryOnRequest(BaseModel):
 
 @app.post("/virtual-try-on-chain")
 async def virtual_try_on_chain(request: ChainedTryOnRequest):
-    """Replicate (Kolors) ile zincirleme giydirme."""
+    """
+    Zincirleme sanal deneme: Birden fazla kıyafeti sırayla giydirir.
+    1. Kullanıcı fotoğrafı + ilk kıyafet → sonuç1
+    2. sonuç1 + ikinci kıyafet → sonuç2
+    3. sonuç2 + üçüncü kıyafet → sonuç3 (final)
+    """
     temp_dir = tempfile.gettempdir()
     session_id = str(uuid.uuid4())
+    hf_token = os.environ.get('HF_TOKEN')
     temp_files = []
 
     try:
-        # Başlangıç resmi (Kullanıcı)
+        # Kullanıcı fotoğrafını decode et
         person_bytes = base64.b64decode(request.person_image_base64)
         current_person_path = os.path.join(temp_dir, f"chain_person_{session_id}.jpg")
         with open(current_person_path, "wb") as f:
             f.write(person_bytes)
         temp_files.append(current_person_path)
 
-        progress_results = []
+        client = Client("yisol/IDM-VTON", token=hf_token)
+
+        progress_results = []  # Her adımın sonucunu tut
 
         for i, garment in enumerate(request.garments):
-            g_url = garment.get("image_url", "")
-            g_cat_tr = garment.get("category", "").lower()
-            
-            if not g_url: continue
+            garment_url = garment.get("image_url", "")
+            garment_desc = garment.get("description", "A stylish garment")
 
-            # Kategori Mapping (Kritik!)
-            # Replicate/Kolors: 'Upper-body', 'Lower-body', 'Dress' bekler.
-            replicate_cat = "Upper-body"
-            if any(x in g_cat_tr for x in ["pantolon", "etek", "şort", "sort", "alt"]):
-                replicate_cat = "Lower-body"
-            elif any(x in g_cat_tr for x in ["elbise", "fistan", "tulum"]):
-                replicate_cat = "Dress"
+            if not garment_url:
+                continue
 
-            # Replicate Çağrısı
-            output = replicate.run(
-                "cuuupid/kolors-virtual-try-on:57a0786522c0766299b8006e89758778f7734f0c4cf5796013a7c6f059f13e7c",
-                input={
-                    "person_img": open(current_person_path, "rb"),
-                    "garment_img": g_url, # Replicate doğrudan URL kabul eder
-                    "category": replicate_cat
-                }
+            # Kıyafet resmini URL'den indir
+            garment_path = os.path.join(temp_dir, f"chain_garment_{session_id}_{i}.jpg")
+            temp_files.append(garment_path)
+
+            img_response = requests.get(garment_url, timeout=30)
+            img_response.raise_for_status()
+            with open(garment_path, "wb") as f:
+                f.write(img_response.content)
+
+            # HuggingFace'e gönder
+            result = client.predict(
+                dict={"background": gradio_file(current_person_path), "layers": [], "composite": None},
+                garm_img=gradio_file(garment_path),
+                garment_des=garment_desc,
+                is_checked=True,
+                is_checked_crop=False,
+                denoise_steps=30,
+                seed=42,
+                api_name="/tryon"
             )
-            
-            res_url = output if isinstance(output, str) else output[0]
-            img_res = requests.get(res_url)
-            
-            # Bir sonraki adım için resmi güncelle
-            next_person_path = os.path.join(temp_dir, f"chain_res_{session_id}_{i}.jpg")
-            with open(next_person_path, "wb") as f:
-                f.write(img_res.content)
+
+            # Sonucu bir sonraki adımın "person" resmi olarak kaydet
+            next_person_path = os.path.join(temp_dir, f"chain_result_{session_id}_{i}.jpg")
             temp_files.append(next_person_path)
+            shutil.copy2(result[0], next_person_path)
             current_person_path = next_person_path
 
-            # Base64 dönüştür (UI için)
-            step_base64 = base64.b64encode(img_res.content).decode('utf-8')
-            progress_results.append({
-                "step": i + 1,
-                "garment_name": garment.get("name", f"Parça {i+1}"),
-                "image_base64": step_base64
-            })
+            # Bu adımın sonuç resmini base64 olarak kaydet
+            with open(result[0], "rb") as img_file:
+                step_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+                progress_results.append({
+                    "step": i + 1,
+                    "garment_name": garment.get("name", f"Parça {i+1}"),
+                    "image_base64": step_base64
+                })
+
+        if not progress_results:
+            return JSONResponse(status_code=400, content={"status": "error", "message": "Hiçbir kıyafet giydirilemedi."})
 
         return {
             "status": "success",
+            "message": f"{len(progress_results)} parça başarıyla giydirildi!",
             "final_image_base64": progress_results[-1]["image_base64"],
             "steps": progress_results
         }
+
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
     finally:
@@ -177,52 +194,53 @@ class SingleStepTryOnRequest(BaseModel):
 
 @app.post("/virtual-try-on-step")
 async def virtual_try_on_step(request: SingleStepTryOnRequest):
-    """Tekli adımı Replicate (Kolors) ile yap."""
+    """
+    Tek bir kıyafeti giydirir ve sonucu döner.
+    Flutter bu endpoint'i her kıyafet için sırayla çağırır.
+    Bir önceki sonucu person_image olarak gönderir → zincirleme etki.
+    """
     temp_dir = tempfile.gettempdir()
     session_id = str(uuid.uuid4())
-    
+    hf_token = os.environ.get('HF_TOKEN')
+    temp_files = []
+
     try:
+        # Kullanıcı/önceki sonuç fotoğrafını decode et
         person_bytes = base64.b64decode(request.person_image_base64)
         person_path = os.path.join(temp_dir, f"step_person_{session_id}.jpg")
         with open(person_path, "wb") as f:
             f.write(person_bytes)
+        temp_files.append(person_path)
 
-        # Kategori tespiti
-        g_cat_tr = request.category.lower()
-        replicate_cat = "Upper-body"
-        if any(x in g_cat_tr for x in ["pantolon", "etek", "şort", "sort", "alt"]):
-            replicate_cat = "Lower-body"
-        elif any(x in g_cat_tr for x in ["elbise", "fistan", "tulum"]):
-            replicate_cat = "Dress"
+        # Kıyafet resmini URL'den indir
+        garment_path = os.path.join(temp_dir, f"step_garment_{session_id}.jpg")
+        img_response = requests.get(request.garment_image_url, timeout=30)
+        img_response.raise_for_status()
+        with open(garment_path, "wb") as f:
+            f.write(img_response.content)
+        temp_files.append(garment_path)
 
-        output = replicate.run(
-            "cuuupid/kolors-virtual-try-on:57a0786522c0766299b8006e89758778f7734f0c4cf5796013a7c6f059f13e7c",
-            input={
-                "person_img": open(person_path, "rb"),
-                "garment_img": request.garment_image_url,
-                "category": replicate_cat
-            }
+        # HuggingFace'e gönder
+        client = Client("yisol/IDM-VTON", token=hf_token)
+        result = client.predict(
+            dict={"background": gradio_file(person_path), "layers": [], "composite": None},
+            garm_img=gradio_file(garment_path),
+            garment_des=request.garment_description,
+            is_checked=True,
+            is_checked_crop=False,
+            denoise_steps=20,
+            seed=42,
+            api_name="/tryon"
         )
-        
-        res_url = output if isinstance(output, str) else output[0]
-        img_res = requests.get(res_url)
-        result_base64 = base64.b64encode(img_res.content).decode('utf-8')
 
-        if os.path.exists(person_path): os.remove(person_path)
-        
-        return {
-            "status": "success",
-            "result_image_base64": result_base64
-        }
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+        with open(result[0], "rb") as img_file:
+            result_base64 = base64.b64encode(img_file.read()).decode('utf-8')
 
         return {
             "status": "success",
             "message": "Kıyafet başarıyla giydirildi!",
             "result_image_base64": result_base64
         }
-
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
     finally:
@@ -232,6 +250,8 @@ async def virtual_try_on_step(request: SingleStepTryOnRequest):
                     os.remove(tf)
                 except:
                     pass
+
+
 
 # ==========================================
 # 5. AI KOMBİN ÖNERİ SİSTEMİ
@@ -875,3 +895,413 @@ def calculate_popularity(kombin: list):
         print(f"Popülerlik hesaplama hatası: {e}")
         return {"percentage": 0, "message": ""}
 
+
+# ==========================================
+# DEPO ENDPOINTS
+# ==========================================
+
+# ── Helper: Write a log to Firestore ──
+def _write_log(log_type: str, message: str, details: dict = None):
+    """Firestore logs koleksiyonuna kayıt ekler."""
+    if not db:
+        return
+    try:
+        log_data = {
+            "type": log_type,
+            "message": message,
+            "timestamp": firestore.SERVER_TIMESTAMP,
+            "details": details or {}
+        }
+        db.collection("logs").add(log_data)
+    except Exception as e:
+        print(f"Log yazma hatası: {e}")
+
+
+# ── 1. Barkod–NFC Eşleştirme: NFC'ye barkod yaz ──
+class NfcBarcodeMatchRequest(BaseModel):
+    uid: str          # NFC UID
+    barkod: str       # Barkod numarası
+
+@app.post("/depo/nfc-barkod-esle")
+async def nfc_barkod_esle(request: NfcBarcodeMatchRequest):
+    """
+    Verilen UID'li NFC etiketine barkod numarasını yazar.
+    kullanim_sayisi +1, son_islem = now
+    """
+    if not db:
+        raise HTTPException(status_code=500, detail="Veritabanı bağlantısı yok.")
+    try:
+        doc_ref = db.collection("products").document(request.uid)
+        doc = doc_ref.get()
+
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail=f"UID bulunamadı: {request.uid}")
+
+        data = doc.to_dict()
+        current_count = data.get("kullanim_sayisi", 0) or 0
+
+        doc_ref.update({
+            "barkod": request.barkod,
+            "kullanim_sayisi": current_count + 1,
+            "son_islem": firestore.SERVER_TIMESTAMP,
+        })
+
+        _write_log(
+            "barcode_match",
+            f"NFC eşleştirildi: UID={request.uid} → Barkod={request.barkod}",
+            {"uid": request.uid, "barkod": request.barkod}
+        )
+
+        return {"status": "ok", "message": "NFC eşleştirildi", "uid": request.uid, "barkod": request.barkod}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── 2. NFC Bilgi Görüntüleme ──
+@app.get("/depo/nfc-bilgi")
+async def nfc_bilgi(uid: str):
+    """
+    Bir UID'ye ait NFC içeriğini + barkoddan amz_id + catalogdan ürün detaylarını döner.
+    """
+    if not db:
+        raise HTTPException(status_code=500, detail="Veritabanı bağlantısı yok.")
+    try:
+        # 1. products/{uid} belgesini çek
+        prod_doc = db.collection("products").document(uid).get()
+        if not prod_doc.exists:
+            raise HTTPException(status_code=404, detail=f"UID bulunamadı: {uid}")
+
+        prod_data = prod_doc.to_dict()
+        barkod = prod_data.get("barkod", "0000000000000")
+
+        # 2. Eğer barkod default (sıfır) ise sadece NFC bilgilerini döndür
+        if barkod == "0000000000000" or not barkod:
+            return {
+                "status": "ok",
+                "nfc": _serialize_firestore(prod_data),
+                "barkod_detay": None,
+                "urun": None,
+            }
+
+        # 3. barcodes/{barkod} belgesini çek
+        barkod_doc = db.collection("barcodes").document(barkod).get()
+        barkod_data = barkod_doc.to_dict() if barkod_doc.exists else {}
+
+        amz_id = barkod_data.get("amz_id", "")
+        renk = barkod_data.get("renk", "")
+        size = barkod_data.get("size", "")
+        stok = barkod_data.get("stok", 0)
+        category = barkod_data.get("category", "")
+
+        # 4. catalog'dan ürünü bul
+        urun_data = None
+        if amz_id:
+            cat_col = category if category else _guess_category(amz_id)
+            if cat_col:
+                urun_docs = (
+                    db.collection("catalog")
+                    .document(cat_col)
+                    .collection("products")
+                    .where("amz_id", "==", amz_id)
+                    .limit(1)
+                    .stream()
+                )
+                for u in urun_docs:
+                    urun_data = u.to_dict()
+                    urun_data["catalog_id"] = u.id
+                    break
+
+            # Fallback: tüm kategorilerde ara
+            if not urun_data:
+                for cat_name in ["ayakkabi", "tisort", "pantolon", "elbise"]:
+                    urun_docs = (
+                        db.collection("catalog")
+                        .document(cat_name)
+                        .collection("products")
+                        .where("amz_id", "==", amz_id)
+                        .limit(1)
+                        .stream()
+                    )
+                    for u in urun_docs:
+                        urun_data = u.to_dict()
+                        urun_data["catalog_id"] = u.id
+                        break
+                    if urun_data:
+                        break
+
+        return {
+            "status": "ok",
+            "nfc": _serialize_firestore(prod_data),
+            "barkod_detay": {
+                "amz_id": amz_id,
+                "renk": renk,
+                "size": size,
+                "stok": stok,
+                "category": category,
+            },
+            "urun": _serialize_firestore(urun_data) if urun_data else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── 3. NFC Yeniden Eşleştir (tek NFC için) ──
+class NfcReeMatchRequest(BaseModel):
+    uid: str
+    barkod: str
+
+@app.post("/depo/nfc-yeniden-esle")
+async def nfc_yeniden_esle(request: NfcReeMatchRequest):
+    """Tek bir NFC için barkod günceller, kullanim_sayisi ve son_islem yeniler."""
+    return await nfc_barkod_esle(request)
+
+
+# ── 4. Stok Kontrolü (NFC ile) ──
+@app.get("/depo/stok-nfc")
+async def stok_nfc(uid: str):
+    """
+    NFC UID'sine göre stok bilgisi getirir.
+    Ana ürün + tüm kardeş barkodların size bazlı stoğu döner.
+    """
+    if not db:
+        raise HTTPException(status_code=500, detail="Veritabanı bağlantısı yok.")
+    try:
+        # 1. UID → barkod
+        prod_doc = db.collection("products").document(uid).get()
+        if not prod_doc.exists:
+            raise HTTPException(status_code=404, detail=f"UID bulunamadı: {uid}")
+        barkod = prod_doc.to_dict().get("barkod", "")
+
+        if not barkod or barkod == "0000000000000":
+            raise HTTPException(status_code=400, detail="Bu NFC henüz bir barkoda eşleştirilmemiş.")
+
+        return await _stok_by_barkod(barkod)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── 5. Stok Kontrolü (Barkod ile) ──
+@app.get("/depo/stok-barkod")
+async def stok_barkod(barkod: str):
+    """Barkod numarasına göre stok bilgisi getirir."""
+    if not db:
+        raise HTTPException(status_code=500, detail="Veritabanı bağlantısı yok.")
+    try:
+        return await _stok_by_barkod(barkod)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _stok_by_barkod(barkod: str):
+    """Ortak stok sorgulama mantığı."""
+    # 1. barcodes/{barkod}
+    barkod_doc = db.collection("barcodes").document(barkod).get()
+    if not barkod_doc.exists:
+        raise HTTPException(status_code=404, detail=f"Barkod bulunamadı: {barkod}")
+
+    barkod_data = barkod_doc.to_dict()
+    amz_id = barkod_data.get("amz_id", "")
+    category = barkod_data.get("category", "")
+
+    # 2. catalog'dan ana ürün bilgisi
+    urun_data = None
+    if amz_id:
+        for cat_name in [category] + ["ayakkabi", "tisort", "pantolon", "elbise"]:
+            if not cat_name:
+                continue
+            urun_docs = (
+                db.collection("catalog")
+                .document(cat_name)
+                .collection("products")
+                .where("amz_id", "==", amz_id)
+                .limit(1)
+                .stream()
+            )
+            for u in urun_docs:
+                urun_data = u.to_dict()
+                urun_data["catalog_id"] = u.id
+                break
+            if urun_data:
+                break
+
+    # 3. Aynı amz_id'ye sahip tüm kardeş barkodları çek
+    kardas_barkodlar = []
+    if amz_id:
+        kardas_docs = (
+            db.collection("barcodes")
+            .where("amz_id", "==", amz_id)
+            .stream()
+        )
+        for k in kardas_docs:
+            k_data = k.to_dict()
+            kardas_barkodlar.append({
+                "barkod_id": k.id,
+                "size": k_data.get("size", ""),
+                "renk": k_data.get("renk", ""),
+                "stok": k_data.get("stok", 0),
+                "category": k_data.get("category", ""),
+            })
+
+        # Boyuta göre sırala
+        kardas_barkodlar.sort(key=lambda x: str(x.get("size", "")))
+
+    return {
+        "status": "ok",
+        "amz_id": amz_id,
+        "urun": _serialize_firestore(urun_data) if urun_data else None,
+        "secili_barkod": {
+            "barkod_id": barkod,
+            "amz_id": amz_id,
+            "renk": barkod_data.get("renk", ""),
+            "size": barkod_data.get("size", ""),
+            "stok": barkod_data.get("stok", 0),
+            "category": barkod_data.get("category", ""),
+        },
+        "tum_beden_stoklari": kardas_barkodlar,
+    }
+
+
+# ── 6. Operasyon Logları ──
+@app.get("/depo/logs")
+async def get_logs(log_type: str = None, limit: int = 50):
+    """Depo operasyon loglarını döner."""
+    if not db:
+        raise HTTPException(status_code=500, detail="Veritabanı bağlantısı yok.")
+    try:
+        query = db.collection("logs")
+        if log_type:
+            query = query.where("type", "==", log_type)
+        docs = query.limit(limit).stream()
+
+        logs = []
+        for doc in docs:
+            d = doc.to_dict()
+            d["log_id"] = doc.id
+            logs.append(_serialize_firestore(d))
+
+        # Sort by timestamp descending (client side since we may not have index)
+        logs.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+
+        return {"status": "ok", "logs": logs}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── 7. NFC Kayıt (Yeni NFC ekle) ──
+class NfcRegisterRequest(BaseModel):
+    uid: str
+
+@app.post("/depo/nfc-kayit")
+async def nfc_kayit(request: NfcRegisterRequest):
+    """
+    Yeni bir NFC etiketini sisteme default değerlerle kaydeder.
+    Zaten kayıtlıysa hata döner.
+    """
+    if not db:
+        raise HTTPException(status_code=500, detail="Veritabanı bağlantısı yok.")
+    try:
+        doc_ref = db.collection("products").document(request.uid)
+        doc = doc_ref.get()
+
+        if doc.exists:
+            return {"status": "already_exists", "message": "Bu UID zaten kayıtlı.", "uid": request.uid}
+
+        doc_ref.set({
+            "uid": request.uid,
+            "barkod": "0000000000000",
+            "isPaid": False,
+            "kullanim_sayisi": 0,
+            "son_islem": firestore.SERVER_TIMESTAMP,
+        })
+
+        _write_log(
+            "nfc_register",
+            f"Yeni NFC kaydedildi: UID={request.uid}",
+            {"uid": request.uid}
+        )
+
+        return {"status": "ok", "message": "NFC başarıyla kaydedildi.", "uid": request.uid}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── 8. Satın Alma — Stok Azalt ──
+class PurchaseRequest(BaseModel):
+    uid: str   # NFC UID
+
+@app.post("/depo/satin-al")
+async def satin_al(request: PurchaseRequest):
+    """
+    Satın alma işleminde:
+    1. products/{uid} → barkod al
+    2. barcodes/{barkod} → stok -= 1
+    3. products/{uid} → isPaid=True
+    """
+    if not db:
+        raise HTTPException(status_code=500, detail="Veritabanı bağlantısı yok.")
+    try:
+        prod_doc = db.collection("products").document(request.uid).get()
+        if not prod_doc.exists:
+            raise HTTPException(status_code=404, detail=f"UID bulunamadı: {request.uid}")
+
+        barkod = prod_doc.to_dict().get("barkod", "")
+        if not barkod or barkod == "0000000000000":
+            raise HTTPException(status_code=400, detail="Bu NFC henüz barkoda eşleştirilmemiş.")
+
+        barkod_ref = db.collection("barcodes").document(barkod)
+        barkod_doc = barkod_ref.get()
+        if not barkod_doc.exists:
+            raise HTTPException(status_code=404, detail=f"Barkod bulunamadı: {barkod}")
+
+        current_stok = barkod_doc.to_dict().get("stok", 0) or 0
+        new_stok = max(0, current_stok - 1)
+
+        batch = db.batch()
+        batch.update(barkod_ref, {"stok": new_stok})
+        batch.update(db.collection("products").document(request.uid), {"isPaid": True, "son_islem": firestore.SERVER_TIMESTAMP})
+        batch.commit()
+
+        _write_log(
+            "purchase",
+            f"Satın alma: UID={request.uid}, Barkod={barkod}, Yeni Stok={new_stok}",
+            {"uid": request.uid, "barkod": barkod, "stok_oncesi": current_stok, "stok_sonrasi": new_stok}
+        )
+
+        return {"status": "ok", "barkod": barkod, "stok_kalan": new_stok}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Yardımcı: Firestore Timestamp'leri serialize et ──
+def _serialize_firestore(data):
+    """Firestore Timestamp gibi serialize edilemeyen tipleri string'e çevirir."""
+    if data is None:
+        return None
+    result = {}
+    for k, v in data.items():
+        if hasattr(v, 'isoformat'):
+            result[k] = v.isoformat()
+        elif hasattr(v, 'timestamp_pb'):
+            # Firestore Timestamp
+            try:
+                result[k] = v.strftime("%Y-%m-%d %H:%M:%S") if hasattr(v, 'strftime') else str(v)
+            except:
+                result[k] = str(v)
+        else:
+            result[k] = v
+    return result
+
+
+def _guess_category(amz_id: str) -> str:
+    """AMZ ID'ye göre kategori tahmin et (fallback)."""
+    return ""
