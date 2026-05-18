@@ -2,9 +2,8 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List
-import os, json, firebase_admin, uuid, shutil, base64, tempfile, requests, re
+import os, json, firebase_admin, uuid, shutil, base64, tempfile, requests, re, time
 from firebase_admin import credentials, firestore
-from gradio_client import Client, file as gradio_file
 from datetime import datetime
 
 app = FastAPI()
@@ -47,211 +46,280 @@ async def check_payment(uid: str):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# ==========================================
-# 3. VIRTUAL TRY-ON — TEK PARÇA
-# ==========================================
-@app.post("/virtual-try-on")
-def virtual_try_on(person_image: UploadFile = File(...), garment_image: UploadFile = File(...)):
-    temp_dir = tempfile.gettempdir()
-    temp_id = str(uuid.uuid4())
-    person_path = os.path.join(temp_dir, f"person_{temp_id}.jpg")
-    garment_path = os.path.join(temp_dir, f"garment_{temp_id}.jpg")
-
+@app.get("/depo/stok-ozet")
+async def depo_stok_ozet():
+    """Depo ana sayfası için, sadece NFC ile veritabanına kayıt edilmiş toplam ürün (products koleksiyonu) sayısını döndürür."""
     try:
-        with open(person_path, "wb") as buffer:
-            shutil.copyfileobj(person_image.file, buffer)
-        with open(garment_path, "wb") as buffer:
-            shutil.copyfileobj(garment_image.file, buffer)
-
-        hf_token = os.environ.get('HF_TOKEN')
-        client = Client("yisol/IDM-VTON", token=hf_token)
-
-        result = client.predict(
-            dict={"background": gradio_file(person_path), "layers": [], "composite": None},
-            garm_img=gradio_file(garment_path),
-            garment_des="A stylish garment",
-            is_checked=True,
-            is_checked_crop=False,
-            denoise_steps=30,
-            seed=42,
-            api_name="/tryon"
-        )
-
-        with open(result[0], "rb") as image_file:
-            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-
-        return {"status": "success", "message": "Kıyafet başarıyla giydirildi!", "image_base64": encoded_string}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-    finally:
-        if os.path.exists(person_path): os.remove(person_path)
-        if os.path.exists(garment_path): os.remove(garment_path)
-
-# ==========================================
-# 4. VIRTUAL TRY-ON — ZİNCİRLEME KOMBİN
-# ==========================================
-class ChainedTryOnRequest(BaseModel):
-    person_image_base64: str
-    garments: list  # [{"image_url": "...", "description": "Siyah slim fit pantolon, dar kesim, uzun paça"}, ...]
-
-@app.post("/virtual-try-on-chain")
-async def virtual_try_on_chain(request: ChainedTryOnRequest):
-    """
-    Zincirleme sanal deneme: Birden fazla kıyafeti sırayla giydirir.
-    1. Kullanıcı fotoğrafı + ilk kıyafet → sonuç1
-    2. sonuç1 + ikinci kıyafet → sonuç2
-    3. sonuç2 + üçüncü kıyafet → sonuç3 (final)
-    """
-    temp_dir = tempfile.gettempdir()
-    session_id = str(uuid.uuid4())
-    hf_token = os.environ.get('HF_TOKEN')
-    temp_files = []
-
-    try:
-        # Kullanıcı fotoğrafını decode et
-        person_bytes = base64.b64decode(request.person_image_base64)
-        current_person_path = os.path.join(temp_dir, f"chain_person_{session_id}.jpg")
-        with open(current_person_path, "wb") as f:
-            f.write(person_bytes)
-        temp_files.append(current_person_path)
-
-        client = Client("yisol/IDM-VTON", token=hf_token)
-
-        progress_results = []  # Her adımın sonucunu tut
-
-        for i, garment in enumerate(request.garments):
-            garment_url = garment.get("image_url", "")
-            garment_desc = garment.get("description", "A stylish garment")
-
-            if not garment_url:
-                continue
-
-            # Kıyafet resmini URL'den indir
-            garment_path = os.path.join(temp_dir, f"chain_garment_{session_id}_{i}.jpg")
-            temp_files.append(garment_path)
-
-            img_response = requests.get(garment_url, timeout=30)
-            img_response.raise_for_status()
-            with open(garment_path, "wb") as f:
-                f.write(img_response.content)
-
-            # HuggingFace'e gönder
-            result = client.predict(
-                dict={"background": gradio_file(current_person_path), "layers": [], "composite": None},
-                garm_img=gradio_file(garment_path),
-                garment_des=garment_desc,
-                is_checked=True,
-                is_checked_crop=False,
-                denoise_steps=30,
-                seed=42,
-                api_name="/tryon"
-            )
-
-            # Sonucu bir sonraki adımın "person" resmi olarak kaydet
-            next_person_path = os.path.join(temp_dir, f"chain_result_{session_id}_{i}.jpg")
-            temp_files.append(next_person_path)
-            shutil.copy2(result[0], next_person_path)
-            current_person_path = next_person_path
-
-            # Bu adımın sonuç resmini base64 olarak kaydet
-            with open(result[0], "rb") as img_file:
-                step_base64 = base64.b64encode(img_file.read()).decode('utf-8')
-                progress_results.append({
-                    "step": i + 1,
-                    "garment_name": garment.get("name", f"Parça {i+1}"),
-                    "image_base64": step_base64
-                })
-
-        if not progress_results:
-            return JSONResponse(status_code=400, content={"status": "error", "message": "Hiçbir kıyafet giydirilemedi."})
-
+        if not db:
+            return {"status": "error", "detail": "Veritabanı bağlantısı yok"}
+        
+        # Sadece nfc kayıtlı ürünlerin sayısı (products koleksiyonundaki toplam belge sayısı)
+        docs = db.collection("products").get()
         return {
-            "status": "success",
-            "message": f"{len(progress_results)} parça başarıyla giydirildi!",
-            "final_image_base64": progress_results[-1]["image_base64"],
-            "steps": progress_results
+            "status": "ok",
+            "toplam_nfc_urun": len(docs)
         }
-
     except Exception as e:
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-    finally:
-        for tf in temp_files:
-            if os.path.exists(tf):
-                try:
-                    os.remove(tf)
-                except:
-                    pass
+        return {"status": "error", "detail": str(e)}
+
+# ==========================================
+# FASHN.AI YARDIMCI FONKSİYONLAR
+# ==========================================
+
+# Uygulama kategori adı → Fashn.ai category eşlemesi
+FASHN_CATEGORY_MAP = {
+    # Üst parçalar
+    "tisort":   "tops",
+    "gomlek":   "tops",
+    "kazak":    "tops",
+    "hirka":    "tops",
+    "mont":     "tops",
+    "ceket":    "tops",
+    "blazer":   "tops",
+    "üst":      "tops",
+    "top":      "tops",
+    # Alt parçalar
+    "pantolon": "bottoms",
+    "etek":     "bottoms",
+    "şort":     "bottoms",
+    "alt":      "bottoms",
+    # Tek parça
+    "elbise":   "one-pieces",
+    "tulum":    "one-pieces",
+    "takım":    "one-pieces",
+    # Ayakkabı → v1.6 desteklemiyor, "auto" ile denenir
+    "ayakkabi": "auto",
+    "ayakkabı": "auto",
+}
+
+def map_category(raw_category: str) -> str:
+    """Türkçe kategori adını Fashn.ai kategori değerine dönüştürür."""
+    key = raw_category.lower().strip()
+    return FASHN_CATEGORY_MAP.get(key, "auto")
+
+
+def fashn_run(person_image_b64: str, garment_image_url: str, category: str, mode: str = "balanced") -> str:
+    """
+    Fashn.ai /v1/run endpoint'ine istek atar ve prediction ID döner.
+    tryon-max modeli kullanır — ayakkabı, çanta, şapka dahil tüm kategorileri destekler.
+    person_image_b64: "data:image/jpeg;base64,..." formatında tam base64 string
+    garment_image_url: kıyafetin URL'i
+    category: Türkçe kategori (map_category ile eşlenir ama tryon-max'e gönderilmez — otomatik algılar)
+    """
+    api_key = os.environ.get('FASHN_API_KEY')
+    if not api_key:
+        raise Exception("FASHN_API_KEY environment variable bulunamadı!")
+
+    # tryon-max: prompt ile kategoriye özel ipucu ver (ayakkabı için özellikle önemli)
+    category_prompts = {
+        "tops":       "fit the top garment naturally on the upper body",
+        "bottoms":    "fit the bottom garment naturally on the lower body",
+        "one-pieces": "fit the full-body garment naturally from shoulders to feet",
+        "auto":       "fit the shoes naturally on the feet only",
+    }
+    prompt = category_prompts.get(category, "")
+
+    payload = {
+        "model_name": "tryon-max",
+        "inputs": {
+            "model_image":     person_image_b64,
+            "product_image":   garment_image_url,  # tryon-max: product_image (v1.6'da garment_image idi)
+            "prompt":          prompt,
+            "resolution":      "1k",               # kredi tasarrufu: 1k yeterli (2k=daha pahalı)
+            "generation_mode": "balanced",          # balanced: hız/kalite dengesi
+            "output_format":   "jpeg",
+            "return_base64":   True,
+        }
+    }
+
+    resp = requests.post(
+        "https://api.fashn.ai/v1/run",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("error"):
+        raise Exception(f"Fashn.ai run hatası: {data['error']}")
+    return data["id"]
+
+
+
+def fashn_poll(prediction_id: str, timeout: int = 180) -> str:
+    """
+    Fashn.ai /v1/status/{id} endpoint'ini polling yapar.
+    Tamamlanınca base64 string döner (data:image/jpeg;base64,...)
+    Timeout aşılınca hata fırlatır.
+    """
+    api_key = os.environ.get('FASHN_API_KEY')
+    url = f"https://api.fashn.ai/v1/status/{prediction_id}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    start = time.time()
+    while time.time() - start < timeout:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        status = data.get("status", "")
+
+        if status == "completed":
+            output = data.get("output", [])
+            if not output:
+                raise Exception("Fashn.ai tamamlandı ama output boş döndü.")
+            # return_base64=True olduğu için output[0] zaten "data:image/jpeg;base64,..."
+            return output[0]
+        elif status in ("failed", "error"):
+            raise Exception(f"Fashn.ai işlem hatası: {data.get('error', 'Bilinmeyen hata')}")
+        # "starting" veya "processing" → bekle
+        time.sleep(2)
+
+    raise Exception(f"Fashn.ai zaman aşımı ({timeout}s): prediction_id={prediction_id}")
+
+
+def person_bytes_to_b64(person_bytes: bytes) -> str:
+    """Ham bytes'ı Fashn.ai'nin beklediği 'data:image/jpeg;base64,...' formatına çevirir."""
+    return "data:image/jpeg;base64," + base64.b64encode(person_bytes).decode('utf-8')
+
+
+def b64_data_to_raw(b64_data: str) -> bytes:
+    """'data:image/jpeg;base64,...' formatındaki string'den raw bytes çıkarır."""
+    if "," in b64_data:
+        b64_data = b64_data.split(",", 1)[1]
+    return base64.b64decode(b64_data)
 
 
 # ==========================================
-# 4b. VIRTUAL TRY-ON — TEK ADIM (Adım Adım Canlı Giydirme)
+# 3. VIRTUAL TRY-ON — TEK ADIM (Fashn.ai)
 # ==========================================
 class SingleStepTryOnRequest(BaseModel):
-    person_image_base64: str
+    person_image_base64: str          # raw base64 (prefix olmadan da olur)
     garment_image_url: str
-    garment_description: str = "A stylish garment"
-    category: str = "üst giyim"
+    garment_description: str = ""     # artık kullanılmıyor, geriye dönük uyumluluk için tutuldu
+    category: str = "auto"            # Türkçe veya Fashn.ai kategori adı
 
 @app.post("/virtual-try-on-step")
 async def virtual_try_on_step(request: SingleStepTryOnRequest):
     """
-    Tek bir kıyafeti giydirir ve sonucu döner.
+    Fashn.ai ile tek bir kıyafet giydirir.
     Flutter bu endpoint'i her kıyafet için sırayla çağırır.
-    Bir önceki sonucu person_image olarak gönderir → zincirleme etki.
+    Bir önceki sonucu person_image_base64 olarak gönderir → zincirleme.
     """
-    temp_dir = tempfile.gettempdir()
-    session_id = str(uuid.uuid4())
-    hf_token = os.environ.get('HF_TOKEN')
-    temp_files = []
-
     try:
-        # Kullanıcı/önceki sonuç fotoğrafını decode et
-        person_bytes = base64.b64decode(request.person_image_base64)
-        person_path = os.path.join(temp_dir, f"step_person_{session_id}.jpg")
-        with open(person_path, "wb") as f:
-            f.write(person_bytes)
-        temp_files.append(person_path)
+        # Gelen base64'ü Fashn.ai formatına getir
+        raw_b64 = request.person_image_base64
+        if not raw_b64.startswith("data:"):
+            raw_b64 = "data:image/jpeg;base64," + raw_b64
 
-        # Kıyafet resmini URL'den indir
-        garment_path = os.path.join(temp_dir, f"step_garment_{session_id}.jpg")
-        img_response = requests.get(request.garment_image_url, timeout=30)
-        img_response.raise_for_status()
-        with open(garment_path, "wb") as f:
-            f.write(img_response.content)
-        temp_files.append(garment_path)
+        fashn_category = map_category(request.category)
 
-        # HuggingFace'e gönder
-        client = Client("yisol/IDM-VTON", token=hf_token)
-        result = client.predict(
-            dict={"background": gradio_file(person_path), "layers": [], "composite": None},
-            garm_img=gradio_file(garment_path),
-            garment_des=request.garment_description,
-            is_checked=True,
-            is_checked_crop=False,
-            denoise_steps=20,
-            seed=42,
-            api_name="/tryon"
-        )
+        pred_id = fashn_run(raw_b64, request.garment_image_url, fashn_category)
+        result_b64 = fashn_poll(pred_id)
 
-        with open(result[0], "rb") as img_file:
-            result_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+        # Flutter'a prefix'siz base64 gönder (mevcut Flutter kodu base64.decode() kullanıyor)
+        raw_result = result_b64.split(",", 1)[1] if "," in result_b64 else result_b64
 
         return {
             "status": "success",
             "message": "Kıyafet başarıyla giydirildi!",
-            "result_image_base64": result_base64
+            "result_image_base64": raw_result,
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-    finally:
-        for tf in temp_files:
-            if os.path.exists(tf):
-                try:
-                    os.remove(tf)
-                except:
-                    pass
 
 
+# ==========================================
+# 4. VIRTUAL TRY-ON — ZİNCİRLEME KOMBİN (Fashn.ai)
+# ==========================================
+class ChainedTryOnRequest(BaseModel):
+    person_image_base64: str   # raw base64
+    garments: list             # [{"image_url": "...", "name": "...", "category": "pantolon"}, ...]
+
+@app.post("/virtual-try-on-chain")
+async def virtual_try_on_chain(request: ChainedTryOnRequest):
+    """
+    Fashn.ai ile zincirleme giydirme:
+    - Önce ayakkabılar (ayakkabı görsel desteği v1.6'da sınırlı, en sona bırakılır)
+    - Üst parçalar (tops): tişört, gömlek vb.
+    - Alt parçalar (bottoms): pantolon, etek vb.
+    - Tek parçalar (one-pieces): elbise, tulum vb.
+    Her adımın sonucu bir sonraki adımın "person" görseli olarak kullanılır.
+    """
+    try:
+        # Gelen base64'ü Fashn.ai formatına getir
+        current_b64 = request.person_image_base64
+        if not current_b64.startswith("data:"):
+            current_b64 = "data:image/jpeg;base64," + current_b64
+
+        # Giydirilecek parçaları kategoriye göre sırala:
+        # Önce tops, sonra bottoms, sonra one-pieces, en son auto (ayakkabı vb.)
+        CATEGORY_ORDER = {"tops": 0, "bottoms": 1, "one-pieces": 2, "auto": 3}
+        garments_sorted = sorted(
+            [g for g in request.garments if g.get("image_url")],
+            key=lambda g: CATEGORY_ORDER.get(map_category(g.get("category", "auto")), 99)
+        )
+
+        if not garments_sorted:
+            return JSONResponse(status_code=400, content={"status": "error", "message": "Hiç geçerli kıyafet bulunamadı."})
+
+        progress_results = []
+
+        for i, garment in enumerate(garments_sorted):
+            garment_url  = garment.get("image_url", "")
+            garment_name = garment.get("name", f"Parça {i+1}")
+            raw_cat      = garment.get("category", "auto")
+            fashn_cat    = map_category(raw_cat)
+
+            # Fashn.ai'ye gönder
+            pred_id    = fashn_run(current_b64, garment_url, fashn_cat)
+            result_b64 = fashn_poll(pred_id)
+
+            # Sonucu bir sonraki adımın person görseli yap
+            current_b64 = result_b64  # zaten "data:image/jpeg;base64,..." formatında
+
+            # Flutter'a prefix'siz gönder
+            raw_result = result_b64.split(",", 1)[1] if "," in result_b64 else result_b64
+            progress_results.append({
+                "step":         i + 1,
+                "garment_name": garment_name,
+                "image_base64": raw_result,
+            })
+
+        final_b64 = progress_results[-1]["image_base64"]
+        return {
+            "status":             "success",
+            "message":            f"{len(progress_results)} parça başarıyla giydirildi!",
+            "final_image_base64": final_b64,
+            "steps":              progress_results,
+        }
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+
+# ==========================================
+# 4b. VIRTUAL TRY-ON — TEK PARÇA (Geriye Dönük Uyumluluk)
+# ==========================================
+@app.post("/virtual-try-on")
+async def virtual_try_on_legacy(person_image: UploadFile = File(...), garment_image: UploadFile = File(...)):
+    """
+    Eski endpoint — geriye dönük uyumluluk için korunuyor.
+    Fashn.ai'ye yönlendirir.
+    """
+    try:
+        person_bytes  = await person_image.read()
+        garment_bytes = await garment_image.read()
+
+        person_b64  = person_bytes_to_b64(person_bytes)
+        garment_b64 = "data:image/jpeg;base64," + base64.b64encode(garment_bytes).decode('utf-8')
+
+        pred_id    = fashn_run(person_b64, garment_b64, "auto")
+        result_b64 = fashn_poll(pred_id)
+        raw_result = result_b64.split(",", 1)[1] if "," in result_b64 else result_b64
+
+        return {"status": "success", "message": "Kıyafet başarıyla giydirildi!", "image_base64": raw_result}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 # ==========================================
 # 5. AI KOMBİN ÖNERİ SİSTEMİ
@@ -922,12 +990,7 @@ class NfcBarcodeMatchRequest(BaseModel):
     uid: str          # NFC UID
     barkod: str       # Barkod numarası
 
-@app.post("/depo/nfc-barkod-esle")
-async def nfc_barkod_esle(request: NfcBarcodeMatchRequest):
-    """
-    Verilen UID'li NFC etiketine barkod numarasını yazar.
-    kullanim_sayisi +1, son_islem = now
-    """
+async def _do_nfc_esle(request: NfcBarcodeMatchRequest, log_type: str, log_message_prefix: str):
     if not db:
         raise HTTPException(status_code=500, detail="Veritabanı bağlantısı yok.")
     try:
@@ -947,16 +1010,25 @@ async def nfc_barkod_esle(request: NfcBarcodeMatchRequest):
         })
 
         _write_log(
-            "barcode_match",
-            f"NFC eşleştirildi: UID={request.uid} → Barkod={request.barkod}",
+            log_type,
+            f"{log_message_prefix}: UID={request.uid} → Barkod={request.barkod}",
             {"uid": request.uid, "barkod": request.barkod}
         )
 
-        return {"status": "ok", "message": "NFC eşleştirildi", "uid": request.uid, "barkod": request.barkod}
+        return {"status": "ok", "message": "İşlem başarılı", "uid": request.uid, "barkod": request.barkod}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/depo/nfc-barkod-esle")
+async def nfc_barkod_esle(request: NfcBarcodeMatchRequest):
+    """
+    Verilen UID'li NFC etiketine barkod numarasını yazar.
+    kullanim_sayisi +1, son_islem = now
+    """
+    return await _do_nfc_esle(request, "barcode_match", "NFC eşleştirildi")
 
 
 # ── 2. NFC Bilgi Görüntüleme ──
@@ -1056,8 +1128,8 @@ class NfcReeMatchRequest(BaseModel):
 
 @app.post("/depo/nfc-yeniden-esle")
 async def nfc_yeniden_esle(request: NfcReeMatchRequest):
-    """Tek bir NFC için barkod günceller, kullanim_sayisi ve son_islem yeniler."""
-    return await nfc_barkod_esle(request)
+    """Tek bir NFC için barkodd günceller — NFC Güncelle işlemi (nfc_guncelle log tipi)."""
+    return await _do_nfc_esle(request, "nfc_guncelle", "NFC güncellendi")
 
 
 # ── 4. Stok Kontrolü (NFC ile) ──
@@ -1193,6 +1265,25 @@ async def get_logs(log_type: str = None, limit: int = 50):
         return {"status": "ok", "logs": logs}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── 8b. Barkod Doğrulama ──
+@app.get("/depo/barkod-dogrula")
+async def barkod_dogrula(barkod: str):
+    """
+    Verilen barkodun 'barcodes' koleksiyonunda kayıtlı olup olmadığını kontrol eder.
+    gecerli=True ise barkod sistemde kayıtlı.
+    """
+    if not db:
+        return {"status": "error", "gecerli": False, "detail": "Veritabanı bağlantısı yok"}
+    try:
+        doc = db.collection("barcodes").document(barkod).get()
+        if doc.exists:
+            return {"status": "ok", "gecerli": True, "barkod": barkod}
+        else:
+            return {"status": "ok", "gecerli": False, "barkod": barkod, "detail": "Barkod sistemde bulunamadı"}
+    except Exception as e:
+        return {"status": "error", "gecerli": False, "detail": str(e)}
 
 
 # ── 7. NFC Kayıt (Yeni NFC ekle) ──
