@@ -1005,6 +1005,7 @@ async def _do_nfc_esle(request: NfcBarcodeMatchRequest, log_type: str, log_messa
 
         doc_ref.update({
             "barkod": request.barkod,
+            "isPaid": False,
             "kullanim_sayisi": current_count + 1,
             "son_islem": firestore.SERVER_TIMESTAMP,
         })
@@ -1069,25 +1070,19 @@ async def nfc_bilgi(uid: str):
 
         # 4. catalog'dan ürünü bul
         urun_data = None
+        all_categories = ["ayakkabi", "tisort", "pantolon", "elbise"]
         if amz_id:
-            cat_col = category if category else _guess_category(amz_id)
-            if cat_col:
-                urun_docs = (
-                    db.collection("catalog")
-                    .document(cat_col)
-                    .collection("products")
-                    .where("amz_id", "==", amz_id)
-                    .limit(1)
-                    .stream()
-                )
-                for u in urun_docs:
-                    urun_data = u.to_dict()
-                    urun_data["catalog_id"] = u.id
-                    break
+            # Önce barkodun kendi kategorisinde ara
+            search_order = []
+            if category:
+                search_order.append(category)
+            # Sonra tüm kategorilerde ara (fallback)
+            for cat_name in all_categories:
+                if cat_name not in search_order:
+                    search_order.append(cat_name)
 
-            # Fallback: tüm kategorilerde ara
-            if not urun_data:
-                for cat_name in ["ayakkabi", "tisort", "pantolon", "elbise"]:
+            for cat_name in search_order:
+                try:
                     urun_docs = (
                         db.collection("catalog")
                         .document(cat_name)
@@ -1100,8 +1095,13 @@ async def nfc_bilgi(uid: str):
                         urun_data = u.to_dict()
                         urun_data["catalog_id"] = u.id
                         break
-                    if urun_data:
-                        break
+                except Exception as cat_err:
+                    print(f"Catalog arama hatası ({cat_name}): {cat_err}")
+                if urun_data:
+                    break
+
+            if not urun_data:
+                print(f"UYARI: amz_id={amz_id} için hiçbir kategoride ürün bulunamadı")
 
         return {
             "status": "ok",
@@ -1185,22 +1185,33 @@ async def _stok_by_barkod(barkod: str):
 
     # 2. catalog'dan ana ürün bilgisi
     urun_data = None
+    all_categories = ["ayakkabi", "tisort", "pantolon", "elbise"]
     if amz_id:
-        for cat_name in [category] + ["ayakkabi", "tisort", "pantolon", "elbise"]:
+        search_order = []
+        if category:
+            search_order.append(category)
+        for cat_name in all_categories:
+            if cat_name not in search_order:
+                search_order.append(cat_name)
+
+        for cat_name in search_order:
             if not cat_name:
                 continue
-            urun_docs = (
-                db.collection("catalog")
-                .document(cat_name)
-                .collection("products")
-                .where("amz_id", "==", amz_id)
-                .limit(1)
-                .stream()
-            )
-            for u in urun_docs:
-                urun_data = u.to_dict()
-                urun_data["catalog_id"] = u.id
-                break
+            try:
+                urun_docs = (
+                    db.collection("catalog")
+                    .document(cat_name)
+                    .collection("products")
+                    .where("amz_id", "==", amz_id)
+                    .limit(1)
+                    .stream()
+                )
+                for u in urun_docs:
+                    urun_data = u.to_dict()
+                    urun_data["catalog_id"] = u.id
+                    break
+            except Exception as cat_err:
+                print(f"Stok catalog arama hatası ({cat_name}): {cat_err}")
             if urun_data:
                 break
 
